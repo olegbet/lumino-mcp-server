@@ -32,6 +32,7 @@ dependencies = [
     "pydantic>=2.11.5",
     "uvicorn>=0.30.0",
     "starlette>=0.30.0",
+    "networkx>=3.0",
 ]
 
 [project.urls]
