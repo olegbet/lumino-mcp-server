@@ -255,26 +255,405 @@ lumino-mcp-server/
 
 ## MCP Client Integration
 
-### Claude Desktop
+### Method 1: Using MCPM (Recommended for Claude Code CLI / Gemini CLI)
 
-Add to your Claude Desktop configuration (`claude_desktop_config.json`):
+The easiest way to install LUMINO MCP Server for Claude Code CLI or Gemini CLI is using [MCPM](https://github.com/spre-sre/mcpm) - an MCP server package manager.
+
+#### Install MCPM
+
+```bash
+# Clone and build MCPM
+git clone https://github.com/spre-sre/mcpm.git
+cd mcpm
+go build -o mcpm .
+
+# Optional: Add to PATH
+sudo mv mcpm /usr/local/bin/
+```
+
+**Requirements**: Go 1.23+, Git, Python 3.10+, uv (or pip)
+
+#### Install LUMINO MCP Server
+
+```bash
+# Install from GitHub repository (short syntax)
+mcpm install @spre-sre/lumino-mcp-server
+
+# Or use full GitHub URL
+mcpm install https://github.com/spre-sre/lumino-mcp-server.git
+
+# For GitLab repositories (if hosted on GitLab)
+mcpm install gl:@spre-sre/lumino-mcp-server
+
+# Install for specific client
+mcpm install @spre-sre/lumino-mcp-server --claude  # For Claude Code CLI
+mcpm install @spre-sre/lumino-mcp-server --gemini  # For Gemini CLI
+
+# Install globally (works with both Claude and Gemini)
+mcpm install @spre-sre/lumino-mcp-server --global
+```
+
+**Short syntax explained**:
+- `@owner/repo` - Installs from GitHub (default: `https://github.com/owner/repo.git`)
+- `gl:@owner/repo` - Installs from GitLab (`https://gitlab.com/owner/repo.git`)
+- Full URL - Works with any Git repository
+
+This will:
+- Clone the repository to `~/.mcp/servers/lumino-mcp-server/`
+- Auto-detect Python project and install dependencies using `uv` (or pip)
+- Register with Claude Code CLI or Gemini CLI configuration automatically
+
+#### Manage LUMINO
+
+```bash
+# List installed servers
+mcpm list
+
+# Update LUMINO
+mcpm update lumino-mcp-server
+
+# Remove LUMINO
+mcpm remove lumino-mcp-server
+```
+
+---
+
+### Method 2: Manual Configuration
+
+If you prefer manual setup or need to configure Claude Desktop / Cursor, follow these client-specific guides:
+
+#### Claude Desktop
+
+1. **Find your config file location**:
+   - macOS: `~/Library/Application Support/Claude/claude_desktop_config.json`
+   - Windows: `%APPDATA%\Claude\claude_desktop_config.json`
+   - Linux: `~/.config/Claude/claude_desktop_config.json`
+
+2. **Add LUMINO configuration**:
 
 ```json
 {
   "mcpServers": {
     "lumino": {
       "command": "uv",
-      "args": ["run", "--directory", "/path/to/lumino-mcp-server", "python", "main.py"]
+      "args": [
+        "run",
+        "--directory",
+        "/path/to/lumino-mcp-server",
+        "python",
+        "main.py"
+      ],
+      "env": {
+        "PYTHONUNBUFFERED": "1"
+      }
     }
   }
 }
 ```
 
-### Other MCP Clients
+3. **Restart Claude Desktop**
 
-The server supports standard MCP transports:
-- **stdio** - For local desktop integrations
-- **streamable-http** - For Kubernetes deployments
+4. **Verify**: Look for the hammer icon (🔨) in Claude Desktop to see available tools
+
+---
+
+#### Claude Code CLI
+
+**Option A: Using MCPM** (Recommended - see Method 1 above)
+
+**Option B: Manual Configuration**
+
+1. **Find your config file location**:
+   - macOS/Linux: `~/.config/claude/mcp_servers.json`
+   - Windows: `%APPDATA%\claude\mcp_servers.json`
+
+2. **Add LUMINO configuration**:
+
+```json
+{
+  "mcpServers": {
+    "lumino": {
+      "command": "uv",
+      "args": [
+        "run",
+        "--directory",
+        "/path/to/lumino-mcp-server",
+        "python",
+        "main.py"
+      ],
+      "env": {
+        "PYTHONUNBUFFERED": "1"
+      }
+    }
+  }
+}
+```
+
+3. **Verify installation**:
+
+```bash
+# Check MCP servers
+claude mcp list
+
+# Test with a query
+claude "List all namespaces in my cluster"
+```
+
+---
+
+#### Gemini CLI
+
+**Option A: Using MCPM** (Recommended - see Method 1 above)
+
+**Option B: Manual Configuration**
+
+1. **Find your config file location**:
+   - macOS/Linux: `~/.config/gemini/mcp_servers.json`
+   - Windows: `%APPDATA%\gemini\mcp_servers.json`
+
+2. **Add LUMINO configuration**:
+
+```json
+{
+  "mcpServers": {
+    "lumino": {
+      "command": "uv",
+      "args": [
+        "run",
+        "--directory",
+        "/path/to/lumino-mcp-server",
+        "python",
+        "main.py"
+      ],
+      "env": {
+        "PYTHONUNBUFFERED": "1"
+      }
+    }
+  }
+}
+```
+
+3. **Verify installation**:
+
+```bash
+# Check MCP servers
+gemini mcp list
+
+# Test with a query
+gemini "Show me failed pipeline runs"
+```
+
+---
+
+#### Cursor IDE
+
+1. **Open Cursor Settings**:
+   - Press `Cmd+,` (macOS) or `Ctrl+,` (Windows/Linux)
+   - Search for "MCP" or "Model Context Protocol"
+
+2. **Add MCP Server Configuration**:
+
+In Cursor's MCP settings, add:
+
+```json
+{
+  "mcpServers": {
+    "lumino": {
+      "command": "uv",
+      "args": [
+        "run",
+        "--directory",
+        "/path/to/lumino-mcp-server",
+        "python",
+        "main.py"
+      ],
+      "env": {
+        "PYTHONUNBUFFERED": "1"
+      }
+    }
+  }
+}
+```
+
+**Alternative - Using Cursor's settings.json**:
+
+1. Open Command Palette (`Cmd+Shift+P` or `Ctrl+Shift+P`)
+2. Type "Preferences: Open User Settings (JSON)"
+3. Add the MCP configuration:
+
+```json
+{
+  "mcp.servers": {
+    "lumino": {
+      "command": "uv",
+      "args": [
+        "run",
+        "--directory",
+        "/path/to/lumino-mcp-server",
+        "python",
+        "main.py"
+      ],
+      "env": {
+        "PYTHONUNBUFFERED": "1"
+      }
+    }
+  }
+}
+```
+
+3. **Restart Cursor IDE**
+
+4. **Verify**: Open Cursor's AI chat and check if LUMINO tools are available
+
+---
+
+### Configuration Notes
+
+**Replace `/path/to/lumino-mcp-server`** with the actual path where you cloned the repository:
+
+```bash
+# Example paths:
+# macOS/Linux: /Users/username/projects/lumino-mcp-server
+# Windows: C:\Users\username\projects\lumino-mcp-server
+
+# If installed via MCPM:
+# ~/.mcp/servers/lumino-mcp-server/
+```
+
+**Environment Variables** (optional):
+
+Add these to the `env` section if needed:
+
+```json
+{
+  "env": {
+    "PYTHONUNBUFFERED": "1",
+    "KUBERNETES_NAMESPACE": "default",
+    "PROMETHEUS_URL": "http://prometheus:9090",
+    "LOG_LEVEL": "INFO"
+  }
+}
+```
+
+---
+
+### Using Alternative Python Package Managers
+
+#### With pip instead of uv
+
+```json
+{
+  "command": "python",
+  "args": [
+    "/path/to/lumino-mcp-server/main.py"
+  ]
+}
+```
+
+**Note**: Ensure you've activated the virtual environment first:
+
+```bash
+cd /path/to/lumino-mcp-server
+python -m venv venv
+source venv/bin/activate  # On Windows: venv\Scripts\activate
+pip install -e .
+```
+
+#### With poetry
+
+```json
+{
+  "command": "poetry",
+  "args": [
+    "run",
+    "python",
+    "main.py"
+  ],
+  "cwd": "/path/to/lumino-mcp-server"
+}
+```
+
+---
+
+### Testing Your Configuration
+
+After configuring any client, test the connection:
+
+1. **Check if tools are loaded**:
+   - Claude Desktop: Look for 🔨 hammer icon
+   - Claude Code CLI: `claude mcp list`
+   - Gemini CLI: `gemini mcp list`
+   - Cursor: Check AI chat for available tools
+
+2. **Test a simple query**:
+
+```
+"List all namespaces in my Kubernetes cluster"
+```
+
+3. **Check server logs** (if issues):
+
+```bash
+# Run server manually to see errors
+cd /path/to/lumino-mcp-server
+uv run python main.py
+```
+
+Expected output:
+```
+MCP Server running in stdio mode
+Available tools: 38
+Waiting for requests...
+```
+
+---
+
+### Advanced Configuration
+
+#### Multiple Clusters
+
+Configure multiple LUMINO instances for different clusters:
+
+```json
+{
+  "mcpServers": {
+    "lumino-prod": {
+      "command": "uv",
+      "args": ["run", "--directory", "/path/to/lumino-mcp-server", "python", "main.py"],
+      "env": {
+        "KUBECONFIG": "/path/to/prod-kubeconfig.yaml"
+      }
+    },
+    "lumino-dev": {
+      "command": "uv",
+      "args": ["run", "--directory", "/path/to/lumino-mcp-server", "python", "main.py"],
+      "env": {
+        "KUBECONFIG": "/path/to/dev-kubeconfig.yaml"
+      }
+    }
+  }
+}
+```
+
+#### Custom Log Level
+
+```json
+{
+  "env": {
+    "LOG_LEVEL": "DEBUG",
+    "MCP_SERVER_LOG_LEVEL": "DEBUG"
+  }
+}
+```
+
+---
+
+### Supported Transports
+
+The server automatically detects the appropriate transport:
+
+- **stdio** - For local desktop integrations (Claude Desktop, Claude Code CLI, Gemini CLI, Cursor)
+- **streamable-http** - For Kubernetes deployments (when `KUBERNETES_NAMESPACE` is set)
 
 ## Troubleshooting
 
