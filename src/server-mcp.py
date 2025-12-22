@@ -309,6 +309,48 @@ OPENSHIFT_PROMETHEUS_ENDPOINTS = {
 
 
 # ============================================================================
+# PROMETHEUS ENDPOINT DISCOVERY HELPERS
+# ============================================================================
+
+class PrometheusEndpointCache:
+    """Cache for discovered Prometheus endpoints with TTL."""
+
+    def __init__(self, ttl_seconds: int = 300):  # 5 minute default cache
+        self._cache: Dict[str, tuple] = {}  # key -> (endpoint, timestamp)
+        self._ttl = ttl_seconds
+
+    def get(self, cluster_key: str = "default") -> Optional[str]:
+        """Get cached endpoint if valid."""
+        if cluster_key in self._cache:
+            endpoint, timestamp = self._cache[cluster_key]
+            if time.time() - timestamp < self._ttl:
+                logger.debug(f"Cache hit for Prometheus endpoint: {endpoint}")
+                return endpoint
+            else:
+                del self._cache[cluster_key]
+        return None
+
+    def set(self, endpoint: str, cluster_key: str = "default") -> None:
+        """Cache endpoint."""
+        self._cache[cluster_key] = (endpoint, time.time())
+        logger.debug(f"Cached Prometheus endpoint: {endpoint}")
+
+    def invalidate(self, cluster_key: str = "default") -> None:
+        """Invalidate cache entry."""
+        if cluster_key in self._cache:
+            del self._cache[cluster_key]
+
+
+# Global cache instance for Prometheus endpoints
+_prometheus_endpoint_cache = PrometheusEndpointCache()
+
+
+def _is_running_in_cluster() -> bool:
+    """Check if we're running inside a Kubernetes cluster."""
+    return os.path.exists("/var/run/secrets/kubernetes.io/serviceaccount/token")
+
+
+# ============================================================================
 # ADAPTIVE LOG PROCESSING HELPERS
 # ============================================================================
 
@@ -3391,88 +3433,369 @@ async def search_resources_by_labels(
 # ============================================================================
 
 
-async def _get_openshift_token() -> Optional[str]:
-    """Get OpenShift authentication token using oc whoami -t command."""
+async def _get_k8s_bearer_token() -> Optional[str]:
+    """
+    Get bearer token for Prometheus authentication from Kubernetes client config.
+
+    Fallback chain:
+    1. Extract from configured Kubernetes client (kubeconfig or in-cluster)
+    2. Read from ServiceAccount token file (in-cluster)
+    3. Environment variable (PROMETHEUS_TOKEN, OPENSHIFT_TOKEN, OC_TOKEN)
+    """
+    # Method 1: Extract token from Kubernetes client configuration
     try:
-        import subprocess
+        from kubernetes.client import Configuration
 
-        # Try to get token from oc command
-        result = subprocess.run(
-            ["oc", "whoami", "-t"],
-            capture_output=True,
-            text=True,
-            timeout=10
-        )
+        k8s_config = Configuration.get_default_copy()
 
-        if result.returncode == 0 and result.stdout.strip():
-            token = result.stdout.strip()
-            logger.info("Successfully obtained OpenShift token via 'oc whoami -t'")
-            return token
-        else:
-            logger.warning(f"oc whoami -t failed: {result.stderr}")
+        # Check for bearer token in the configuration
+        if k8s_config.api_key and k8s_config.api_key.get('authorization'):
+            auth_header = k8s_config.api_key['authorization']
+            if auth_header.startswith('Bearer '):
+                token = auth_header[7:]  # Remove 'Bearer ' prefix
+                logger.info("Successfully obtained bearer token from Kubernetes client config")
+                return token
 
-    except subprocess.TimeoutExpired:
-        logger.warning("oc whoami -t command timed out")
-    except FileNotFoundError:
-        logger.warning("oc command not found - not logged into OpenShift")
     except Exception as e:
-        logger.warning(f"Error getting OpenShift token: {e}")
+        logger.debug(f"Could not extract token from k8s client config: {e}")
 
-    # Try environment variable as fallback
-    token = os.getenv("OPENSHIFT_TOKEN") or os.getenv("OC_TOKEN")
+    # Method 2: Read from ServiceAccount token file (in-cluster scenario)
+    SA_TOKEN_PATH = "/var/run/secrets/kubernetes.io/serviceaccount/token"
+    try:
+        if os.path.exists(SA_TOKEN_PATH):
+            with open(SA_TOKEN_PATH, 'r') as f:
+                token = f.read().strip()
+                if token:
+                    logger.info("Successfully obtained token from ServiceAccount token file")
+                    return token
+    except Exception as e:
+        logger.debug(f"Could not read ServiceAccount token: {e}")
+
+    # Method 3: Environment variable fallback
+    token = os.getenv("PROMETHEUS_TOKEN") or os.getenv("OPENSHIFT_TOKEN") or os.getenv("OC_TOKEN")
     if token:
-        logger.info("Using OpenShift token from environment variable")
+        logger.info("Using token from environment variable")
         return token
 
-    logger.error("Could not obtain OpenShift authentication token")
+    logger.error("Could not obtain authentication token from any source")
+    return None
+
+
+async def _discover_prometheus_via_routes() -> Optional[str]:
+    """
+    Discover Prometheus endpoint via OpenShift Routes.
+
+    Looks for routes in openshift-monitoring namespace:
+    - prometheus-k8s (primary Prometheus)
+    - thanos-querier (Thanos frontend)
+    """
+    if not k8s_custom_api:
+        logger.debug("CustomObjectsApi not available for route discovery")
+        return None
+
+    try:
+        # Query routes in openshift-monitoring namespace
+        routes = k8s_custom_api.list_namespaced_custom_object(
+            group="route.openshift.io",
+            version="v1",
+            namespace="openshift-monitoring",
+            plural="routes"
+        )
+
+        # Priority order for Prometheus routes
+        preferred_routes = ["prometheus-k8s", "thanos-querier"]
+
+        route_items = routes.get("items", [])
+        route_map = {r.get("metadata", {}).get("name"): r for r in route_items}
+
+        for route_name in preferred_routes:
+            if route_name in route_map:
+                route = route_map[route_name]
+                spec = route.get("spec", {})
+                host = spec.get("host")
+
+                if host:
+                    # Determine protocol (check TLS termination)
+                    tls = spec.get("tls")
+                    protocol = "https" if tls else "http"
+                    endpoint = f"{protocol}://{host}"
+
+                    logger.info(f"Discovered Prometheus via OpenShift route '{route_name}': {endpoint}")
+                    return endpoint
+
+        # Fallback: any route with 'prometheus' in the name
+        for route in route_items:
+            route_name = route.get("metadata", {}).get("name", "")
+            if "prometheus" in route_name.lower():
+                host = route.get("spec", {}).get("host")
+                if host:
+                    tls = route.get("spec", {}).get("tls")
+                    protocol = "https" if tls else "http"
+                    endpoint = f"{protocol}://{host}"
+                    logger.info(f"Discovered Prometheus via route '{route_name}': {endpoint}")
+                    return endpoint
+
+    except client.rest.ApiException as e:
+        if e.status == 404:
+            logger.debug("OpenShift routes API not available (not an OpenShift cluster)")
+        else:
+            logger.warning(f"Error querying OpenShift routes: {e}")
+    except Exception as e:
+        logger.warning(f"Error discovering Prometheus via routes: {e}")
+
+    return None
+
+
+async def _discover_prometheus_via_operator_crd() -> Optional[str]:
+    """
+    Discover Prometheus via Prometheus Operator CRDs.
+
+    Looks for:
+    - Prometheus custom resources (monitoring.coreos.com/v1)
+    - Associated services
+    """
+    if not k8s_custom_api or not k8s_core_api:
+        logger.debug("API clients not available for Prometheus Operator CRD discovery")
+        return None
+
+    try:
+        # List all Prometheus custom resources cluster-wide
+        prometheus_resources = k8s_custom_api.list_cluster_custom_object(
+            group="monitoring.coreos.com",
+            version="v1",
+            plural="prometheuses"
+        )
+
+        for prom in prometheus_resources.get("items", []):
+            metadata = prom.get("metadata", {})
+            name = metadata.get("name")
+            namespace = metadata.get("namespace")
+
+            if not name or not namespace:
+                continue
+
+            # The Prometheus Operator creates a service with pattern: prometheus-<name>
+            service_name = f"prometheus-{name}"
+
+            try:
+                service = k8s_core_api.read_namespaced_service(
+                    name=service_name,
+                    namespace=namespace
+                )
+
+                # Get service port (default Prometheus port is 9090)
+                ports = service.spec.ports or []
+                port = 9090
+                for p in ports:
+                    if p.name in ["web", "http", "prometheus"] or p.port == 9090:
+                        port = p.port
+                        break
+
+                # Construct in-cluster service URL
+                endpoint = f"http://{service_name}.{namespace}.svc.cluster.local:{port}"
+                logger.info(f"Discovered Prometheus via Operator CRD: {endpoint}")
+                return endpoint
+
+            except client.rest.ApiException as e:
+                logger.debug(f"Could not find service for Prometheus '{name}': {e}")
+                continue
+
+    except client.rest.ApiException as e:
+        if e.status == 404:
+            logger.debug("Prometheus Operator CRDs not available")
+        else:
+            logger.warning(f"Error querying Prometheus CRDs: {e}")
+    except Exception as e:
+        logger.warning(f"Error discovering Prometheus via Operator CRD: {e}")
+
+    return None
+
+
+async def _discover_prometheus_via_services() -> Optional[str]:
+    """
+    Discover Prometheus by searching for services with prometheus-related labels/names.
+
+    Search criteria:
+    - Services with 'prometheus' in name
+    - Services with label 'app=prometheus' or 'app.kubernetes.io/name=prometheus'
+    - Services exposing port 9090
+    """
+    if not k8s_core_api:
+        logger.debug("CoreV1Api not available for service discovery")
+        return None
+
+    try:
+        # Search common monitoring namespaces first
+        monitoring_namespaces = [
+            "openshift-monitoring",
+            "monitoring",
+            "prometheus",
+            "kube-prometheus",
+            "observability"
+        ]
+
+        # First, try specific namespaces
+        for namespace in monitoring_namespaces:
+            try:
+                services = k8s_core_api.list_namespaced_service(namespace=namespace)
+
+                # Prioritize actual Prometheus server services (not alertmanager, pushgateway, etc.)
+                # Priority: prometheus-server > prometheus-k8s > prometheus > any with prometheus in name
+                priority_names = ["prometheus-server", "prometheus-k8s", "prometheus"]
+                excluded_suffixes = ["-alertmanager", "-pushgateway", "-node-exporter",
+                                   "-kube-state-metrics", "-headless", "-operated"]
+
+                # First pass: look for priority names
+                for priority_name in priority_names:
+                    for service in services.items:
+                        name = service.metadata.name
+                        if name == priority_name:
+                            ports = service.spec.ports or []
+                            port = 9090
+                            for p in ports:
+                                # Accept common Prometheus ports: 9090, 80, 443
+                                if p.port in [9090, 80, 443] or (p.name and p.name in ["web", "http", "https"]):
+                                    port = p.port
+                                    break
+                            endpoint = f"http://{name}.{namespace}.svc.cluster.local:{port}"
+                            logger.info(f"Discovered Prometheus service (priority match): {endpoint}")
+                            return endpoint
+
+                # Second pass: look for services with 'prometheus' but exclude non-server services
+                for service in services.items:
+                    name = service.metadata.name
+                    if "prometheus" in name.lower():
+                        # Skip non-server services
+                        if any(name.lower().endswith(suffix) for suffix in excluded_suffixes):
+                            continue
+
+                        ports = service.spec.ports or []
+                        port = 9090
+                        for p in ports:
+                            if p.port in [9090, 80, 443] or (p.name and p.name in ["web", "http", "https"]):
+                                port = p.port
+                                break
+
+                        endpoint = f"http://{name}.{namespace}.svc.cluster.local:{port}"
+                        logger.info(f"Discovered Prometheus service: {endpoint}")
+                        return endpoint
+
+            except client.rest.ApiException as e:
+                if e.status != 404:
+                    logger.debug(f"Namespace '{namespace}' not accessible: {e}")
+                continue
+
+        # Try cluster-wide search with label selectors
+        label_selectors = [
+            "app=prometheus",
+            "app.kubernetes.io/name=prometheus",
+            "app.kubernetes.io/component=prometheus"
+        ]
+
+        for label_selector in label_selectors:
+            try:
+                services = k8s_core_api.list_service_for_all_namespaces(
+                    label_selector=label_selector
+                )
+
+                if services.items:
+                    service = services.items[0]  # Take first match
+                    name = service.metadata.name
+                    namespace = service.metadata.namespace
+
+                    ports = service.spec.ports or []
+                    port = 9090
+                    for p in ports:
+                        if p.port == 9090 or (p.name and p.name in ["web", "http"]):
+                            port = p.port
+                            break
+
+                    endpoint = f"http://{name}.{namespace}.svc.cluster.local:{port}"
+                    logger.info(f"Discovered Prometheus via label selector '{label_selector}': {endpoint}")
+                    return endpoint
+
+            except client.rest.ApiException as e:
+                logger.debug(f"Error with label selector '{label_selector}': {e}")
+                continue
+
+    except Exception as e:
+        logger.warning(f"Error discovering Prometheus via services: {e}")
+
     return None
 
 
 async def _discover_prometheus_endpoint(cluster_override: Optional[str] = None) -> Optional[str]:
-    """Discover Prometheus endpoint for the current OpenShift cluster."""
-    try:
-        # If cluster override provided, use predefined endpoints
-        if cluster_override:
-            if cluster_override in OPENSHIFT_PROMETHEUS_ENDPOINTS:
-                return OPENSHIFT_PROMETHEUS_ENDPOINTS[cluster_override]["url"]
+    """
+    Discover Prometheus endpoint using multiple strategies.
 
-        import subprocess
+    Priority order depends on runtime environment:
+    - In-cluster: Services -> CRD -> Routes (prefer internal URLs)
+    - Local: Routes -> CRD -> Services (prefer external URLs)
 
-        # Get current cluster info from oc
-        result = subprocess.run(
-            ["oc", "whoami", "--show-server"],
-            capture_output=True,
-            text=True,
-            timeout=10
-        )
+    Args:
+        cluster_override: Optional cluster name for predefined endpoint lookup
 
-        if result.returncode == 0 and result.stdout.strip():
-            api_server = result.stdout.strip()
-            # Extract cluster domain from API server URL
-            # Example: https://api.stone-prd-rh01.pg1f.p1.openshiftapps.com:6443
-            if "api." in api_server:
-                cluster_domain = api_server.replace("https://api.", "").replace(":6443", "")
+    Returns:
+        Prometheus endpoint URL or None if not found
+    """
+    # 0. Check for PROMETHEUS_URL environment variable (highest priority)
+    env_prometheus_url = os.getenv("PROMETHEUS_URL")
+    if env_prometheus_url:
+        logger.info(f"Using Prometheus endpoint from PROMETHEUS_URL environment variable: {env_prometheus_url}")
+        return env_prometheus_url
 
-                # Try common Prometheus endpoints for this cluster
-                prometheus_endpoints = [
-                    f"https://prometheus-k8s-openshift-monitoring.apps.{cluster_domain}",
-                    f"https://thanos-querier-openshift-monitoring.apps.{cluster_domain}"
-                ]
+    # 1. Check for cluster override in predefined endpoints
+    if cluster_override and cluster_override in OPENSHIFT_PROMETHEUS_ENDPOINTS:
+        endpoint = OPENSHIFT_PROMETHEUS_ENDPOINTS[cluster_override].get("url")
+        if endpoint:
+            logger.info(f"Using predefined endpoint for cluster '{cluster_override}': {endpoint}")
+            return endpoint
 
-                for endpoint in prometheus_endpoints:
-                    logger.info(f"Discovered potential Prometheus endpoint: {endpoint}")
-                    return endpoint
+    # 2. Check cache
+    cache_key = cluster_override or "default"
+    cached_endpoint = _prometheus_endpoint_cache.get(cache_key)
+    if cached_endpoint:
+        logger.info(f"Using cached Prometheus endpoint: {cached_endpoint}")
+        return cached_endpoint
 
-        # Fallback to predefined endpoints
-        for cluster_name, config in OPENSHIFT_PROMETHEUS_ENDPOINTS.items():
-            if cluster_name != "local":  # Skip local endpoint in cluster environment
-                logger.info(f"Using fallback Prometheus endpoint: {config['url']}")
-                return config["url"]
+    # 3. Discovery chain - order depends on runtime environment
+    if _is_running_in_cluster():
+        # In-cluster: prefer internal service URLs
+        discovery_methods = [
+            ("Service Discovery", _discover_prometheus_via_services),
+            ("Prometheus Operator CRD", _discover_prometheus_via_operator_crd),
+            ("OpenShift Routes", _discover_prometheus_via_routes),
+        ]
+    else:
+        # Local development: prefer external URLs (Routes) that resolve locally
+        discovery_methods = [
+            ("OpenShift Routes", _discover_prometheus_via_routes),
+            ("Prometheus Operator CRD", _discover_prometheus_via_operator_crd),
+            ("Service Discovery", _discover_prometheus_via_services),
+        ]
 
-    except Exception as e:
-        logger.warning(f"Error discovering Prometheus endpoint: {e}")
+    for method_name, discovery_func in discovery_methods:
+        try:
+            logger.debug(f"Attempting Prometheus discovery via: {method_name}")
+            endpoint = await discovery_func()
+            if endpoint:
+                # Cache the discovered endpoint
+                _prometheus_endpoint_cache.set(endpoint, cache_key)
+                return endpoint
+        except Exception as e:
+            logger.warning(f"Discovery method '{method_name}' failed: {e}")
+            continue
 
-    logger.error("Could not discover Prometheus endpoint")
+    # 4. Fallback to predefined endpoints (try all except 'local')
+    for cluster_name, config in OPENSHIFT_PROMETHEUS_ENDPOINTS.items():
+        if cluster_name != "local":
+            endpoint = config.get("url")
+            if endpoint:
+                logger.info(f"Using fallback Prometheus endpoint: {endpoint}")
+                _prometheus_endpoint_cache.set(endpoint, cache_key)
+                return endpoint
+
+    logger.error("Could not discover Prometheus endpoint via any method")
     return None
 
 
@@ -4014,24 +4337,10 @@ async def prometheus_query(
                     "errors": ["Missing time range parameters for range query"]
                 }
 
-        # Get OpenShift authentication token
-        auth_token = await _get_openshift_token()
+        # Get Kubernetes authentication token (optional for vanilla K8s Prometheus)
+        auth_token = await _get_k8s_bearer_token()
         if not auth_token:
-            return {
-                "status": "error",
-                "error_type": "authentication_failed",
-                "message": "Could not obtain OpenShift authentication token",
-                "query_executed": query,
-                "execution_time": 0,
-                "result_count": 0,
-                "data": [],
-                "suggestions": [
-                    "Ensure you are logged into OpenShift cluster: 'oc login'",
-                    "Check if 'oc' command is available",
-                    "Verify cluster connectivity"
-                ],
-                "errors": ["Authentication token not available"]
-            }
+            logger.info(f"[{tool_name}] No bearer token available - will attempt unauthenticated request (common for vanilla Kubernetes Prometheus)")
 
         # Discover or use Prometheus endpoint
         prometheus_url = await _discover_prometheus_endpoint(cluster)
@@ -4045,9 +4354,10 @@ async def prometheus_query(
                 "result_count": 0,
                 "data": [],
                 "suggestions": [
-                    "Check if Prometheus is deployed in openshift-monitoring namespace",
-                    "Verify cluster connectivity",
-                    "Try specifying cluster parameter explicitly"
+                    "Check if Prometheus is deployed (openshift-monitoring, monitoring, or prometheus namespace)",
+                    "Verify Prometheus Operator CRDs are installed if using Prometheus Operator",
+                    "Ensure OpenShift Routes are accessible if on OpenShift",
+                    "Try adding a predefined endpoint in OPENSHIFT_PROMETHEUS_ENDPOINTS config"
                 ],
                 "errors": ["Prometheus endpoint not found"]
             }
@@ -4073,10 +4383,12 @@ async def prometheus_query(
 
         query_url = f"{prometheus_url}{api_path}"
         headers = {
-            "Authorization": f"Bearer {auth_token}",
             "Accept": "application/json",
             "User-Agent": "LUMINO-MCP/1.0"
         }
+        # Only add Authorization header if token is available
+        if auth_token:
+            headers["Authorization"] = f"Bearer {auth_token}"
 
         logger.info(f"[{tool_name}] Executing query against: {query_url}")
 
@@ -4136,8 +4448,9 @@ async def prometheus_query(
                         "result_count": 0,
                         "data": [],
                         "suggestions": [
-                            "Re-login to OpenShift: 'oc login'",
+                            "Refresh your Kubernetes credentials (kubeconfig or ServiceAccount)",
                             "Check if token has expired",
+                            "Set PROMETHEUS_TOKEN environment variable with a valid token",
                             "Verify cluster access permissions"
                         ],
                         "errors": ["Authentication failed"]
