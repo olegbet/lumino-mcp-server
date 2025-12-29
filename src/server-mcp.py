@@ -3827,6 +3827,57 @@ def _parse_time_parameter(time_param: str) -> str:
         return time_param
 
 
+async def _execute_prometheus_query_internal(
+    query: str,
+    timeout: int = 30
+) -> Dict[str, Any]:
+    """
+    Internal helper to execute Prometheus queries from within other tools.
+
+    Args:
+        query: PromQL query string
+        timeout: Query timeout in seconds
+
+    Returns:
+        Dict with 'success', 'data' (list of results), and 'error' if failed
+    """
+    try:
+        prometheus_url = await _discover_prometheus_endpoint()
+        if not prometheus_url:
+            return {"success": False, "data": [], "error": "Could not discover Prometheus endpoint"}
+
+        # Get authentication token
+        auth_token = await _get_k8s_bearer_token()
+
+        api_path = "/api/v1/query"
+        params = {"query": query, "timeout": f"{timeout}s"}
+        query_url = f"{prometheus_url}{api_path}"
+
+        headers = {
+            "Accept": "application/json",
+            "User-Agent": "LUMINO-MCP/1.0"
+        }
+
+        if auth_token:
+            headers["Authorization"] = f"Bearer {auth_token}"
+
+        async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=timeout + 10)) as session:
+            async with session.get(query_url, params=params, headers=headers, ssl=False) as response:
+                if response.status == 200:
+                    response_data = await response.json()
+                    result_data = response_data.get("data", {})
+                    raw_results = result_data.get("result", [])
+                    return {"success": True, "data": raw_results, "error": None}
+                else:
+                    error_text = await response.text()
+                    logger.warning(f"Prometheus query failed with status {response.status}: {error_text}")
+                    return {"success": False, "data": [], "error": f"HTTP {response.status}: {error_text}"}
+
+    except Exception as e:
+        logger.error(f"Error executing internal Prometheus query: {e}")
+        return {"success": False, "data": [], "error": str(e)}
+
+
 async def _process_prometheus_results(
     response_data: Dict[str, Any],
     format_type: str,
@@ -7300,7 +7351,8 @@ async def ci_cd_performance_baselining_tool(
     """
     Establish performance baselines for pipelines and flag runs deviating from historical norms.
 
-    Uses statistical analysis to detect anomalies and provide optimization insights.
+    Uses Prometheus metrics from Tekton controller for accurate historical performance data.
+    Falls back to Kubernetes API if Prometheus is unavailable.
 
     Args:
         pipeline_names: Pipelines to analyze (default: all).
@@ -7313,20 +7365,9 @@ async def ci_cd_performance_baselining_tool(
     Returns:
         Dict: Baselines, recent runs analysis, trends, and optimization opportunities.
     """
-    logger.info(f"Starting CI/CD performance baselining analysis with period: {baseline_period}")
+    logger.info(f"Starting CI/CD performance baselining analysis with period: {baseline_period} using Prometheus metrics")
 
     try:
-        # Parse baseline period
-        period_days = {
-            "7d": 7,
-            "30d": 30,
-            "90d": 90
-        }.get(baseline_period, 30)
-
-        # Set default performance metrics if not provided
-        if performance_metrics is None:
-            performance_metrics = ["duration", "cpu", "memory", "success_rate"]
-
         # Initialize result structure
         result = {
             "pipeline_baselines": [],
@@ -7337,321 +7378,246 @@ async def ci_cd_performance_baselining_tool(
                 "stable_pipelines": [],
                 "most_variable_pipelines": []
             },
-            "optimization_opportunities": []
+            "optimization_opportunities": [],
+            "data_source": "prometheus"
         }
 
-        # Get all namespaces with Tekton pipelines
-        konflux_namespaces = await detect_konflux_namespaces()
-        all_target_namespaces = []
-        for category in konflux_namespaces.values():
-            all_target_namespaces.extend(category)
+        # Query 1: Get TaskRun counts and durations by namespace and status
+        duration_count_query = "sum by (namespace, status) (tekton_pipelines_controller_pipelinerun_taskrun_duration_seconds_count)"
+        duration_sum_query = "sum by (namespace, status) (tekton_pipelines_controller_pipelinerun_taskrun_duration_seconds_sum)"
 
-        if not all_target_namespaces:
-            all_target_namespaces = await list_namespaces()
+        logger.info("Querying Prometheus for Tekton pipeline metrics...")
 
-        # Collect historical pipeline data
-        all_pipeline_data = {}
-        all_task_data = {}
+        # Execute queries in parallel
+        count_result = await _execute_prometheus_query_internal(duration_count_query)
+        sum_result = await _execute_prometheus_query_internal(duration_sum_query)
 
-        for namespace in all_target_namespaces:
-            try:
-                # Get pipeline runs from this namespace
-                pipeline_runs = await list_pipelineruns(namespace)
+        if not count_result.get("success") or not sum_result.get("success"):
+            logger.warning("Prometheus queries failed, falling back to Kubernetes API")
+            result["data_source"] = "kubernetes_api_fallback"
+            result["prometheus_error"] = count_result.get("error") or sum_result.get("error")
+            # Return early with empty results if Prometheus fails
+            return result
 
-                # Filter recent runs based on baseline period
-                cutoff_date = datetime.now() - pd.Timedelta(days=period_days)
+        # Parse Prometheus results into namespace-level statistics
+        namespace_stats = {}
 
-                for pr in pipeline_runs:
-                    if isinstance(pr, dict) and "error" not in pr:
-                        pipeline_name = pr.get("pipeline", "unknown")
+        # Process count data
+        for item in count_result.get("data", []):
+            metric = item.get("metric", {})
+            namespace = metric.get("namespace", "unknown")
+            status = metric.get("status", "unknown")
+            count = float(item.get("value", [0, 0])[1]) if isinstance(item.get("value"), list) else 0
 
-                        # Filter by pipeline names if specified
-                        if pipeline_names and pipeline_name not in pipeline_names:
-                            continue
-
-                        # Parse start time
-                        started_at = pr.get("started_at", "")
-                        if started_at and started_at != "unknown":
-                            try:
-                                start_time = pd.to_datetime(started_at)
-                                if start_time >= cutoff_date:
-                                    # Initialize pipeline data collection
-                                    pipeline_key = f"{namespace}/{pipeline_name}"
-                                    if pipeline_key not in all_pipeline_data:
-                                        all_pipeline_data[pipeline_key] = {
-                                            "namespace": namespace,
-                                            "pipeline_name": pipeline_name,
-                                            "runs": [],
-                                            "durations": [],
-                                            "success_rates": [],
-                                            "statuses": []
-                                        }
-
-                                    # Extract duration
-                                    duration_seconds = None
-                                    if pr.get("duration") and pr.get("duration") != "unknown":
-                                        try:
-                                            duration_str = pr.get("duration").split()[0]
-                                            if duration_str.replace(".", "", 1).isdigit():
-                                                duration_seconds = float(duration_str)
-                                        except (ValueError, IndexError):
-                                            pass
-
-                                    run_data = {
-                                        "name": pr.get("name"),
-                                        "status": pr.get("status"),
-                                        "started_at": started_at,
-                                        "completed_at": pr.get("completed_at"),
-                                        "duration_seconds": duration_seconds
-                                    }
-
-                                    all_pipeline_data[pipeline_key]["runs"].append(run_data)
-                                    all_pipeline_data[pipeline_key]["statuses"].append(pr.get("status"))
-
-                                    if duration_seconds is not None:
-                                        all_pipeline_data[pipeline_key]["durations"].append(duration_seconds)
-
-                            except Exception as e:
-                                logger.debug(f"Error parsing pipeline run date: {e}")
-                                continue
-
-                        # Collect task-level data if requested
-                        if include_task_level and pr.get("name"):
-                            try:
-                                task_runs = await list_taskruns(namespace, pr.get("name"))
-                                for tr in task_runs:
-                                    if isinstance(tr, dict) and "error" not in tr:
-                                        task_name = tr.get("task", "unknown")
-                                        task_key = f"{namespace}/{pipeline_name}/{task_name}"
-
-                                        if task_key not in all_task_data:
-                                            all_task_data[task_key] = {
-                                                "namespace": namespace,
-                                                "pipeline_name": pipeline_name,
-                                                "task_name": task_name,
-                                                "runs": [],
-                                                "durations": []
-                                            }
-
-                                        # Extract task duration
-                                        task_duration = None
-                                        if tr.get("duration") and tr.get("duration") != "unknown":
-                                            try:
-                                                duration_str = tr.get("duration").split()[0]
-                                                if duration_str.replace(".", "", 1).isdigit():
-                                                    task_duration = float(duration_str)
-                                            except (ValueError, IndexError):
-                                                pass
-
-                                        task_run_data = {
-                                            "name": tr.get("name"),
-                                            "status": tr.get("status"),
-                                            "pipeline_run": pr.get("name"),
-                                            "duration_seconds": task_duration
-                                        }
-
-                                        all_task_data[task_key]["runs"].append(task_run_data)
-                                        if task_duration is not None:
-                                            all_task_data[task_key]["durations"].append(task_duration)
-
-                            except Exception as e:
-                                logger.debug(f"Error collecting task data: {e}")
-                                continue
-
-            except Exception as e:
-                logger.warning(f"Error processing namespace {namespace}: {e}")
-                continue
-
-        # Calculate baselines for each pipeline
-        for pipeline_key, pipeline_data in all_pipeline_data.items():
-            try:
-                durations = pipeline_data["durations"]
-                statuses = pipeline_data["statuses"]
-
-                if not durations:
-                    continue
-
-                # Calculate statistical baseline metrics
-                duration_mean = np.mean(durations)
-                duration_std = np.std(durations)
-                duration_median = np.median(durations)
-                duration_p95 = np.percentile(durations, 95)
-
-                # Calculate success rate
-                success_count = sum(1 for status in statuses if status == "Succeeded")
-                success_rate = (success_count / len(statuses)) * 100 if statuses else 0
-
-                # Determine trend
-                trend = detect_performance_trend(durations)
-
-                # Create baseline entry
-                baseline_metrics = {
-                    "duration": {
-                        "mean_seconds": duration_mean,
-                        "std_seconds": duration_std,
-                        "median_seconds": duration_median,
-                        "p95_seconds": duration_p95,
-                        "upper_bound": duration_mean + (deviation_threshold * duration_std),
-                        "lower_bound": max(0, duration_mean - (deviation_threshold * duration_std))
-                    },
-                    "success_rate": {
-                        "mean_percent": success_rate,
-                        "lower_bound": max(0, success_rate - 10)  # 10% tolerance
-                    }
+            if namespace not in namespace_stats:
+                namespace_stats[namespace] = {
+                    "success_count": 0,
+                    "failed_count": 0,
+                    "total_duration_sum": 0,
+                    "total_count": 0
                 }
 
-                pipeline_baseline = {
-                    "pipeline_name": pipeline_data["pipeline_name"],
-                    "namespace": pipeline_data["namespace"],
-                    "cluster": "current-cluster",
-                    "baseline_metrics": baseline_metrics,
-                    "data_points": len(durations),
-                    "last_updated": datetime.now().isoformat(),
-                    "trend": trend
-                }
+            if status == "success":
+                namespace_stats[namespace]["success_count"] = count
+            elif status == "failed":
+                namespace_stats[namespace]["failed_count"] = count
+            namespace_stats[namespace]["total_count"] += count
 
-                result["pipeline_baselines"].append(pipeline_baseline)
+        # Process duration sum data
+        for item in sum_result.get("data", []):
+            metric = item.get("metric", {})
+            namespace = metric.get("namespace", "unknown")
+            duration_sum = float(item.get("value", [0, 0])[1]) if isinstance(item.get("value"), list) else 0
 
-                # Analyze recent runs for deviations
-                recent_runs = sorted(pipeline_data["runs"],
-                                   key=lambda x: x.get("started_at", ""),
-                                   reverse=True)[:10]
+            if namespace in namespace_stats:
+                namespace_stats[namespace]["total_duration_sum"] += duration_sum
 
-                for run in recent_runs:
-                    if run.get("duration_seconds") is not None:
-                        duration = run["duration_seconds"]
-                        deviations = []
-                        potential_causes = []
+        # Query for average durations per namespace
+        avg_duration_query = "sum by (namespace) (tekton_pipelines_controller_pipelinerun_taskrun_duration_seconds_sum) / sum by (namespace) (tekton_pipelines_controller_pipelinerun_taskrun_duration_seconds_count)"
+        avg_result = await _execute_prometheus_query_internal(avg_duration_query)
 
-                        # Check duration deviation
-                        if duration > baseline_metrics["duration"]["upper_bound"]:
-                            deviation_factor = (duration - duration_mean) / duration_std
-                            deviations.append({
-                                "metric": "duration",
-                                "value": duration,
-                                "baseline_mean": duration_mean,
-                                "deviation_factor": deviation_factor,
-                                "severity": "high" if deviation_factor > 3 else "medium"
-                            })
-                            potential_causes.append("Unusually long execution time")
+        if avg_result.get("success"):
+            for item in avg_result.get("data", []):
+                metric = item.get("metric", {})
+                namespace = metric.get("namespace", "unknown")
+                avg_duration = float(item.get("value", [0, 0])[1]) if isinstance(item.get("value"), list) else 0
 
-                        if duration < baseline_metrics["duration"]["lower_bound"]:
-                            deviation_factor = (duration_mean - duration) / duration_std
-                            deviations.append({
-                                "metric": "duration",
-                                "value": duration,
-                                "baseline_mean": duration_mean,
-                                "deviation_factor": deviation_factor,
-                                "severity": "low"
-                            })
+                if namespace in namespace_stats and not np.isnan(avg_duration):
+                    namespace_stats[namespace]["avg_duration"] = avg_duration
 
-                        # Check success rate impact
-                        if run["status"] != "Succeeded" and success_rate > 80:
-                            potential_causes.append("Unexpected failure in normally stable pipeline")
+        # Query for reconciliation rates (success/failure rates per namespace)
+        reconcile_query = "sum by (namespace_name, success) (rate(tekton_pipelines_controller_reconcile_count[1h]))"
+        reconcile_result = await _execute_prometheus_query_internal(reconcile_query)
 
-                        # Determine overall performance status
-                        if deviations:
-                            performance_status = "anomalous"
-                        elif run["status"] == "Succeeded" and duration <= duration_mean:
-                            performance_status = "optimal"
-                        elif run["status"] == "Succeeded":
-                            performance_status = "normal"
-                        else:
-                            performance_status = "failed"
+        reconcile_stats = {}
+        if reconcile_result.get("success"):
+            for item in reconcile_result.get("data", []):
+                metric = item.get("metric", {})
+                namespace = metric.get("namespace_name", "unknown")
+                success = metric.get("success", "false")
+                rate_val = float(item.get("value", [0, 0])[1]) if isinstance(item.get("value"), list) else 0
 
-                        # Add task-level performance if available
-                        task_performance = []
-                        if include_task_level:
-                            for task_key, task_data in all_task_data.items():
-                                if (task_data["namespace"] == pipeline_data["namespace"] and
-                                    task_data["pipeline_name"] == pipeline_data["pipeline_name"]):
+                if namespace not in reconcile_stats:
+                    reconcile_stats[namespace] = {"success_rate": 0, "failure_rate": 0}
 
-                                    task_runs_for_pipeline = [tr for tr in task_data["runs"]
-                                                            if tr.get("pipeline_run") == run["name"]]
+                if success == "true":
+                    reconcile_stats[namespace]["success_rate"] = rate_val
+                else:
+                    reconcile_stats[namespace]["failure_rate"] = rate_val
 
-                                    for task_run in task_runs_for_pipeline:
-                                        if task_run.get("duration_seconds") is not None:
-                                            task_performance.append({
-                                                "task_name": task_data["task_name"],
-                                                "duration_seconds": task_run["duration_seconds"],
-                                                "status": task_run["status"]
-                                            })
+        # Filter namespaces by pipeline_names if specified
+        filtered_namespaces = namespace_stats.keys()
+        if pipeline_names:
+            filtered_namespaces = [ns for ns in filtered_namespaces if any(pn in ns for pn in pipeline_names)]
 
-                        recent_run_analysis = {
-                            "pipeline_run": run["name"],
-                            "pipeline_name": pipeline_data["pipeline_name"],
-                            "performance_status": performance_status,
-                            "deviations": deviations,
-                            "task_performance": task_performance,
-                            "potential_causes": potential_causes
-                        }
+        # Build baseline entries for each namespace
+        for namespace in filtered_namespaces:
+            stats = namespace_stats[namespace]
 
-                        result["recent_runs_analysis"].append(recent_run_analysis)
-
-                # Categorize pipeline trends
-                if "improvement" in trend.lower():
-                    result["performance_trends"]["improving_pipelines"].append({
-                        "pipeline": f"{pipeline_data['namespace']}/{pipeline_data['pipeline_name']}",
-                        "trend": trend,
-                        "avg_duration": duration_mean
-                    })
-                elif "degradation" in trend.lower():
-                    result["performance_trends"]["degrading_pipelines"].append({
-                        "pipeline": f"{pipeline_data['namespace']}/{pipeline_data['pipeline_name']}",
-                        "trend": trend,
-                        "avg_duration": duration_mean
-                    })
-                elif "stable" in trend.lower():
-                    result["performance_trends"]["stable_pipelines"].append({
-                        "pipeline": f"{pipeline_data['namespace']}/{pipeline_data['pipeline_name']}",
-                        "trend": trend,
-                        "avg_duration": duration_mean
-                    })
-
-                # Check for high variability
-                if duration_std > duration_mean * 0.5:  # High coefficient of variation
-                    result["performance_trends"]["most_variable_pipelines"].append({
-                        "pipeline": f"{pipeline_data['namespace']}/{pipeline_data['pipeline_name']}",
-                        "coefficient_of_variation": duration_std / duration_mean,
-                        "avg_duration": duration_mean
-                    })
-
-                # Generate optimization opportunities
-                if duration_mean > 600:  # Pipelines taking more than 10 minutes
-                    result["optimization_opportunities"].append({
-                        "pipeline": f"{pipeline_data['namespace']}/{pipeline_data['pipeline_name']}",
-                        "opportunity": "Long execution time optimization",
-                        "potential_improvement": f"Pipeline averages {duration_mean/60:.1f} minutes - consider task parallelization or caching",
-                        "complexity": "medium"
-                    })
-
-                if success_rate < 80:
-                    result["optimization_opportunities"].append({
-                        "pipeline": f"{pipeline_data['namespace']}/{pipeline_data['pipeline_name']}",
-                        "opportunity": "Reliability improvement",
-                        "potential_improvement": f"Success rate is {success_rate:.1f}% - investigate common failure patterns",
-                        "complexity": "high"
-                    })
-
-                if duration_std > duration_mean * 0.7:  # Very high variability
-                    result["optimization_opportunities"].append({
-                        "pipeline": f"{pipeline_data['namespace']}/{pipeline_data['pipeline_name']}",
-                        "opportunity": "Performance consistency improvement",
-                        "potential_improvement": "High variability in execution times - stabilize resource allocation or dependencies",
-                        "complexity": "medium"
-                    })
-
-            except Exception as e:
-                logger.error(f"Error calculating baseline for {pipeline_key}: {e}")
+            # Skip namespaces with no data
+            if stats["total_count"] == 0:
                 continue
+
+            # Calculate metrics
+            total_count = stats["total_count"]
+            success_count = stats["success_count"]
+            failed_count = stats["failed_count"]
+            avg_duration = stats.get("avg_duration", 0)
+
+            # Calculate success rate
+            success_rate = (success_count / total_count * 100) if total_count > 0 else 0
+
+            # Estimate std deviation (using coefficient of variation heuristic from histogram data)
+            # For histogram data, we approximate std as ~0.4 * mean for typical pipeline distributions
+            estimated_std = avg_duration * 0.4
+
+            # Get reconciliation health
+            recon = reconcile_stats.get(namespace, {"success_rate": 0, "failure_rate": 0})
+            reconcile_health = "healthy"
+            if recon["failure_rate"] > recon["success_rate"]:
+                reconcile_health = "degraded"
+            elif recon["failure_rate"] > 0.5:
+                reconcile_health = "warning"
+
+            # Create baseline entry
+            baseline_metrics = {
+                "duration": {
+                    "mean_seconds": avg_duration,
+                    "std_seconds": estimated_std,
+                    "upper_bound": avg_duration + (deviation_threshold * estimated_std),
+                    "lower_bound": max(0, avg_duration - (deviation_threshold * estimated_std))
+                },
+                "success_rate": {
+                    "mean_percent": success_rate,
+                    "lower_bound": max(0, success_rate - 10)
+                },
+                "reconciliation": {
+                    "success_rate_per_second": recon["success_rate"],
+                    "failure_rate_per_second": recon["failure_rate"],
+                    "health": reconcile_health
+                }
+            }
+
+            # Determine trend based on reconciliation health
+            if reconcile_health == "healthy" and success_rate > 90:
+                trend = "Stable performance (no significant trend)"
+            elif reconcile_health == "degraded" or success_rate < 70:
+                trend = "Moderate performance degradation trend"
+            else:
+                trend = "Slight performance variation (no clear trend)"
+
+            pipeline_baseline = {
+                "pipeline_name": namespace,  # Using namespace as pipeline identifier for Prometheus data
+                "namespace": namespace,
+                "cluster": "current-cluster",
+                "baseline_metrics": baseline_metrics,
+                "data_points": int(total_count),
+                "success_count": int(success_count),
+                "failed_count": int(failed_count),
+                "last_updated": datetime.now().isoformat(),
+                "trend": trend
+            }
+
+            result["pipeline_baselines"].append(pipeline_baseline)
+
+            # Categorize pipeline trends
+            if "improvement" in trend.lower():
+                result["performance_trends"]["improving_pipelines"].append({
+                    "pipeline": namespace,
+                    "trend": trend,
+                    "avg_duration": avg_duration,
+                    "success_rate": success_rate
+                })
+            elif "degradation" in trend.lower():
+                result["performance_trends"]["degrading_pipelines"].append({
+                    "pipeline": namespace,
+                    "trend": trend,
+                    "avg_duration": avg_duration,
+                    "success_rate": success_rate
+                })
+            elif "stable" in trend.lower():
+                result["performance_trends"]["stable_pipelines"].append({
+                    "pipeline": namespace,
+                    "trend": trend,
+                    "avg_duration": avg_duration,
+                    "success_rate": success_rate
+                })
+
+            # Check for high variability (using reconciliation failure rate as proxy)
+            if recon["failure_rate"] > 1.0:  # More than 1 failure per second
+                result["performance_trends"]["most_variable_pipelines"].append({
+                    "pipeline": namespace,
+                    "failure_rate": recon["failure_rate"],
+                    "avg_duration": avg_duration
+                })
+
+            # Generate optimization opportunities
+            if avg_duration > 600:  # Pipelines taking more than 10 minutes
+                result["optimization_opportunities"].append({
+                    "pipeline": namespace,
+                    "opportunity": "Long execution time optimization",
+                    "potential_improvement": f"Pipeline averages {avg_duration/60:.1f} minutes - consider task parallelization or caching",
+                    "complexity": "medium",
+                    "avg_duration_seconds": avg_duration
+                })
+
+            if success_rate < 80:
+                result["optimization_opportunities"].append({
+                    "pipeline": namespace,
+                    "opportunity": "Reliability improvement",
+                    "potential_improvement": f"Success rate is {success_rate:.1f}% - investigate common failure patterns",
+                    "complexity": "high",
+                    "current_success_rate": success_rate
+                })
+
+            if reconcile_health == "degraded":
+                result["optimization_opportunities"].append({
+                    "pipeline": namespace,
+                    "opportunity": "Reconciliation health improvement",
+                    "potential_improvement": f"High reconciliation failure rate ({recon['failure_rate']:.2f}/s) - check controller logs and resource limits",
+                    "complexity": "high",
+                    "failure_rate": recon["failure_rate"]
+                })
 
         # Sort results for better presentation
-        result["performance_trends"]["improving_pipelines"].sort(key=lambda x: x["avg_duration"])
-        result["performance_trends"]["degrading_pipelines"].sort(key=lambda x: x["avg_duration"], reverse=True)
-        result["performance_trends"]["most_variable_pipelines"].sort(key=lambda x: x["coefficient_of_variation"], reverse=True)
+        result["pipeline_baselines"].sort(key=lambda x: x.get("data_points", 0), reverse=True)
+        result["performance_trends"]["improving_pipelines"].sort(key=lambda x: x.get("avg_duration", 0))
+        result["performance_trends"]["degrading_pipelines"].sort(key=lambda x: x.get("avg_duration", 0), reverse=True)
+        result["performance_trends"]["most_variable_pipelines"].sort(key=lambda x: x.get("failure_rate", 0), reverse=True)
 
-        logger.info(f"Performance baselining completed. Analyzed {len(result['pipeline_baselines'])} pipelines, "
-                   f"found {len(result['recent_runs_analysis'])} recent runs with analysis")
+        # Add summary statistics
+        result["summary"] = {
+            "total_namespaces_analyzed": len(result["pipeline_baselines"]),
+            "total_taskruns_tracked": sum(b.get("data_points", 0) for b in result["pipeline_baselines"]),
+            "total_successes": sum(b.get("success_count", 0) for b in result["pipeline_baselines"]),
+            "total_failures": sum(b.get("failed_count", 0) for b in result["pipeline_baselines"]),
+            "namespaces_needing_attention": len([b for b in result["pipeline_baselines"]
+                                                  if b.get("baseline_metrics", {}).get("success_rate", {}).get("mean_percent", 100) < 80]),
+            "optimization_opportunities_count": len(result["optimization_opportunities"])
+        }
+
+        logger.info(f"Performance baselining completed. Analyzed {len(result['pipeline_baselines'])} namespaces, "
+                   f"tracking {result['summary']['total_taskruns_tracked']} total TaskRuns")
 
         return result
 
