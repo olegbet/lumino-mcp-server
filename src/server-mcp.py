@@ -9048,7 +9048,7 @@ async def _analyze_node_resources_new(trend_period: str, forecast_horizon: str, 
         cpu_query = 'avg by (instance) (100 - (avg(irate(node_cpu_seconds_total{mode="idle"}[5m])) by (instance) * 100))'
 
         try:
-            cpu_result = await mcp__openshift__prometheus_query(
+            cpu_result = await prometheus_query(
                 query=cpu_query,
                 query_type="range",
                 start_time=start_time_iso,
@@ -9089,7 +9089,7 @@ async def _analyze_node_resources_new(trend_period: str, forecast_horizon: str, 
         memory_query = '(1 - (node_memory_MemAvailable_bytes / node_memory_MemTotal_bytes)) * 100'
 
         try:
-            memory_result = await mcp__openshift__prometheus_query(
+            memory_result = await prometheus_query(
                 query=memory_query,
                 query_type="range",
                 start_time=start_time_iso,
@@ -9128,7 +9128,7 @@ async def _analyze_node_resources_new(trend_period: str, forecast_horizon: str, 
         disk_query = '(1 - (node_filesystem_avail_bytes{fstype!="tmpfs"} / node_filesystem_size_bytes{fstype!="tmpfs"})) * 100'
 
         try:
-            disk_result = await mcp__openshift__prometheus_query(
+            disk_result = await prometheus_query(
                 query=disk_query,
                 query_type="range",
                 start_time=start_time_iso,
@@ -9206,7 +9206,7 @@ async def _analyze_cluster_capacity_new(core_api, log) -> Dict[str, Any]:
 
         try:
             # Cluster CPU usage
-            cpu_usage_result = await mcp__openshift__prometheus_query(
+            cpu_usage_result = await prometheus_query(
                 'avg(100 - (avg by (instance) (irate(node_cpu_seconds_total{mode="idle"}[5m])) * 100))'
             )
             if cpu_usage_result.get("status") == "success" and cpu_usage_result.get("data"):
@@ -9218,7 +9218,7 @@ async def _analyze_cluster_capacity_new(core_api, log) -> Dict[str, Any]:
 
         try:
             # Cluster memory usage
-            memory_usage_result = await mcp__openshift__prometheus_query(
+            memory_usage_result = await prometheus_query(
                 'avg(100 - (avg by (instance) (node_memory_MemAvailable_bytes / node_memory_MemTotal_bytes)) * 100)'
             )
             if memory_usage_result.get("status") == "success" and memory_usage_result.get("data"):
@@ -9316,7 +9316,7 @@ async def resource_bottleneck_forecaster(
 
         # Test Prometheus connectivity using the tool
         try:
-            test_query_result = await mcp__openshift__prometheus_query("up")
+            test_query_result = await prometheus_query("up")
             if test_query_result.get("status") != "success":
                 logger.warning("Could not connect to Prometheus endpoint, using mock data")
                 return {
@@ -9378,7 +9378,7 @@ async def resource_bottleneck_forecaster(
                     namespace_cpu_query = f'sum(rate(container_cpu_usage_seconds_total{{namespace="{namespace}"}}[5m])) * 100'
 
                     # Get current namespace resource usage
-                    cpu_result = await mcp__openshift__prometheus_query(namespace_cpu_query)
+                    cpu_result = await prometheus_query(namespace_cpu_query)
                     if cpu_result.get("status") == "success" and cpu_result.get("data"):
                         data = cpu_result["data"]
                         if data and len(data) > 0 and 'value' in data[0]:
@@ -9396,7 +9396,7 @@ async def resource_bottleneck_forecaster(
 
                     # Namespace memory usage
                     memory_query = f'sum(container_memory_working_set_bytes{{namespace="{namespace}"}}) / 1024 / 1024 / 1024'
-                    memory_result = await mcp__openshift__prometheus_query(memory_query)
+                    memory_result = await prometheus_query(memory_query)
                     if memory_result.get("status") == "success" and memory_result.get("data"):
                         data = memory_result["data"]
                         if data and len(data) > 0 and 'value' in data[0]:
