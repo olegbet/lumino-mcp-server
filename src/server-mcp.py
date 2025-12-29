@@ -3864,6 +3864,12 @@ async def _process_prometheus_results(
             raw_results = raw_results[:limit]
             logger.info(f"Limited results to {limit} items")
 
+        # Apply safety limit to prevent excessive response sizes (max 500 series)
+        MAX_SERIES_LIMIT = 500
+        if len(raw_results) > MAX_SERIES_LIMIT:
+            logger.warning(f"Truncating {len(raw_results)} series to {MAX_SERIES_LIMIT} to prevent excessive response size")
+            raw_results = raw_results[:MAX_SERIES_LIMIT]
+
         # Format results based on requested format
         if format_type == "table":
             formatted_data = _format_as_table(raw_results, result_type)
@@ -4053,12 +4059,49 @@ def _format_as_json(results: List[Dict], result_type: str) -> List[Dict]:
                 }
 
             elif result_type == "matrix":
-                # Range query
+                # Range query - downsample to avoid excessive response size
                 values = result.get("values", [])
+                total_count = len(values)
+
+                # Calculate statistical summary instead of returning all raw data
+                numeric_values = []
+                for v in values:
+                    try:
+                        numeric_values.append(float(v[1]))
+                    except (ValueError, TypeError, IndexError):
+                        pass
+
+                stats = {}
+                if numeric_values:
+                    sorted_vals = sorted(numeric_values)
+                    stats = {
+                        "min": round(min(numeric_values), 4),
+                        "max": round(max(numeric_values), 4),
+                        "avg": round(sum(numeric_values) / len(numeric_values), 4),
+                        "latest": round(numeric_values[-1], 4),
+                        "first": round(numeric_values[0], 4),
+                        "p50": round(sorted_vals[len(sorted_vals) // 2], 4),
+                        "p95": round(sorted_vals[int(len(sorted_vals) * 0.95)], 4) if len(sorted_vals) > 1 else round(sorted_vals[0], 4),
+                    }
+
+                # Downsample values to max 50 points for trend visualization
+                MAX_DATAPOINTS = 50
+                sampled_values = []
+                if total_count > MAX_DATAPOINTS:
+                    step = total_count / MAX_DATAPOINTS
+                    for i in range(MAX_DATAPOINTS):
+                        idx = int(i * step)
+                        sampled_values.append(values[idx])
+                else:
+                    sampled_values = values
+
                 formatted_result = {
                     "metric": metric,
-                    "values": values,
-                    "value_count": len(values),
+                    "statistics": stats,
+                    "values": sampled_values,  # Keep as "values" for backward compatibility
+                    "value_count": total_count,
+                    "sampled_count": len(sampled_values),
+                    "downsampled": total_count > MAX_DATAPOINTS,
                     "time_range": {
                         "start": values[0][0] if values else None,
                         "end": values[-1][0] if values else None
@@ -9044,8 +9087,8 @@ async def _analyze_node_resources_new(trend_period: str, forecast_horizon: str, 
         forecasts = []
         forecast_points = calculate_forecast_intervals(forecast_horizon)
 
-        # Node CPU usage query
-        cpu_query = 'avg by (instance) (100 - (avg(irate(node_cpu_seconds_total{mode="idle"}[5m])) by (instance) * 100))'
+        # Node CPU usage query - aggregate to avoid series explosion from pod restarts
+        cpu_query = 'max by (instance) (100 - (avg by (instance) (irate(node_cpu_seconds_total{mode="idle"}[5m])) * 100))'
 
         try:
             cpu_result = await prometheus_query(
@@ -9053,7 +9096,8 @@ async def _analyze_node_resources_new(trend_period: str, forecast_horizon: str, 
                 query_type="range",
                 start_time=start_time_iso,
                 end_time=end_time_iso,
-                step="300s"
+                step="300s",
+                limit=100  # Limit to top 100 nodes
             )
 
             if cpu_result.get("status") == "success" and cpu_result.get("data"):
@@ -9085,8 +9129,8 @@ async def _analyze_node_resources_new(trend_period: str, forecast_horizon: str, 
         except Exception as e:
             log.warning(f"Error fetching CPU metrics: {str(e)}")
 
-        # Node memory usage query
-        memory_query = '(1 - (node_memory_MemAvailable_bytes / node_memory_MemTotal_bytes)) * 100'
+        # Node memory usage query - aggregate by instance to avoid series explosion from pod restarts
+        memory_query = 'max by (instance) ((1 - (node_memory_MemAvailable_bytes / node_memory_MemTotal_bytes)) * 100)'
 
         try:
             memory_result = await prometheus_query(
@@ -9094,7 +9138,8 @@ async def _analyze_node_resources_new(trend_period: str, forecast_horizon: str, 
                 query_type="range",
                 start_time=start_time_iso,
                 end_time=end_time_iso,
-                step="300s"
+                step="300s",
+                limit=100  # Limit to top 100 nodes
             )
 
             if memory_result.get("status") == "success" and memory_result.get("data"):
@@ -9124,8 +9169,12 @@ async def _analyze_node_resources_new(trend_period: str, forecast_horizon: str, 
         except Exception as e:
             log.warning(f"Error fetching memory metrics: {str(e)}")
 
-        # Node disk usage query
-        disk_query = '(1 - (node_filesystem_avail_bytes{fstype!="tmpfs"} / node_filesystem_size_bytes{fstype!="tmpfs"})) * 100'
+        # Node disk usage query - filter out kubelet pod volumes and aggregate by instance/mountpoint
+        # to avoid series explosion from node-exporter pod restarts
+        disk_query = '''max by (instance, mountpoint) (
+            (1 - (node_filesystem_avail_bytes{fstype!="tmpfs", mountpoint!~"/var/lib/kubelet/pods.*|/run/.*"}
+                / node_filesystem_size_bytes{fstype!="tmpfs", mountpoint!~"/var/lib/kubelet/pods.*|/run/.*"})) * 100
+        )'''
 
         try:
             disk_result = await prometheus_query(
@@ -9133,7 +9182,8 @@ async def _analyze_node_resources_new(trend_period: str, forecast_horizon: str, 
                 query_type="range",
                 start_time=start_time_iso,
                 end_time=end_time_iso,
-                step="300s"
+                step="300s",
+                limit=200  # Limit disk filesystems to top 200
             )
 
             if disk_result.get("status") == "success" and disk_result.get("data"):
