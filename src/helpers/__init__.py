@@ -2,6 +2,7 @@
 
 from .utils import (
     calculate_duration,
+    calculate_duration_seconds,
     parse_time_period,
     parse_time_parameters,
     format_yaml_output,
@@ -222,6 +223,7 @@ from .resource_topology import (
 __all__ = [
     # Utils
     "calculate_duration",
+    "calculate_duration_seconds",
     "parse_time_period",
     "parse_time_parameters",
     "format_yaml_output",

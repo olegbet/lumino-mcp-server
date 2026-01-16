@@ -33,6 +33,7 @@ from prometheus_client.parser import text_string_to_metric_families
 # Helper imports
 from helpers import (
     calculate_duration,
+    calculate_duration_seconds,
     parse_time_period,
     parse_time_parameters,
     format_yaml_output,
@@ -797,13 +798,19 @@ async def list_pipelineruns(namespace: str) -> List[Dict[str, Any]]:
                     current_status = latest_condition.get("reason", "Unknown")
 
                 # Extract timing information
-                start_time = status.get("startTime", "unknown")
-                completion_time = status.get("completionTime", "unknown")
+                start_time = status.get("startTime")
+                completion_time = status.get("completionTime")
+
+                # Determine if pipeline is still running
+                is_running = current_status in ("Running", "Started", "Pending", "PipelineRunPending")
 
                 # Calculate duration using helper function
+                # For running pipelines, calculate elapsed time from start
                 duration = "unknown"
+                duration_seconds = None
                 try:
-                    duration = calculate_duration(start_time, completion_time)
+                    duration = calculate_duration(start_time, completion_time, use_current_if_missing=is_running)
+                    duration_seconds = calculate_duration_seconds(start_time, completion_time, use_current_if_missing=is_running)
                 except Exception as e:
                     logger.debug(f"Duration calculation failed for PipelineRun {metadata.get('name', 'unknown')}: {e}")
                     duration = "calculation_error"
@@ -815,6 +822,7 @@ async def list_pipelineruns(namespace: str) -> List[Dict[str, Any]]:
                     "started_at": start_time,
                     "completed_at": completion_time,
                     "duration": duration,
+                    "duration_seconds": duration_seconds,
                 }
 
                 result.append(pipeline_run_info)
@@ -883,15 +891,58 @@ async def list_taskruns(namespace: str, pipeline_run: Optional[str] = None) -> L
             if pipeline_run and tr.get("metadata", {}).get("labels", {}).get("tekton.dev/pipelineRun") != pipeline_run:
                 continue
 
+            metadata = tr.get("metadata", {})
+            spec = tr.get("spec", {})
             status = tr.get("status", {})
+            labels = metadata.get("labels", {})
+
+            conditions = status.get("conditions", [])
+            current_status = conditions[0].get("reason", "Unknown") if conditions else "Unknown"
+
+            # Determine if task is still running
+            is_running = current_status in ("Running", "Started", "Pending", "TaskRunPending")
+
+            start_time = status.get("startTime")
+            completion_time = status.get("completionTime")
+
+            # Get task name from multiple possible sources
+            # Priority: taskRef.name > labels > pipelineTask label > extract from taskrun name
+            task_name = None
+
+            # 1. Check spec.taskRef.name (direct reference to named Task)
+            task_ref = spec.get("taskRef", {})
+            if task_ref and task_ref.get("name"):
+                task_name = task_ref.get("name")
+
+            # 2. Check common Tekton labels
+            if not task_name:
+                task_name = (
+                    labels.get("tekton.dev/task") or
+                    labels.get("tekton.dev/pipelineTask") or
+                    labels.get("pipelines.tekton.dev/task")
+                )
+
+            # 3. Try to extract from TaskRun name (format: pipelinerun-taskname-suffix)
+            if not task_name:
+                tr_name = metadata.get("name", "")
+                pr_name = labels.get("tekton.dev/pipelineRun", "")
+                if pr_name and tr_name.startswith(pr_name + "-"):
+                    # Remove pipelinerun prefix and random suffix
+                    remaining = tr_name[len(pr_name) + 1:]
+                    # Task name is everything except the last random suffix (usually 5-6 chars)
+                    parts = remaining.rsplit("-", 1)
+                    if len(parts) > 1 and len(parts[-1]) <= 6:
+                        task_name = parts[0]
+
             result.append({
-                "name": tr.get("metadata", {}).get("name", "unknown"),
-                "task": tr.get("spec", {}).get("taskRef", {}).get("name", "unknown"),
-                "pipeline_run": tr.get("metadata", {}).get("labels", {}).get("tekton.dev/pipelineRun", "unknown"),
-                "status": status.get("conditions", [{}])[0].get("reason", "Unknown") if status.get("conditions") else "Unknown",
-                "started_at": status.get("startTime", "unknown"),
-                "completed_at": status.get("completionTime", "unknown"),
-                "duration": calculate_duration(status.get("startTime"), status.get("completionTime")),
+                "name": metadata.get("name"),
+                "task": task_name,
+                "pipeline_run": labels.get("tekton.dev/pipelineRun"),
+                "status": current_status,
+                "started_at": start_time,
+                "completed_at": completion_time,
+                "duration": calculate_duration(start_time, completion_time, use_current_if_missing=is_running),
+                "duration_seconds": calculate_duration_seconds(start_time, completion_time, use_current_if_missing=is_running),
             })
 
         logger.info(f"Found {len(result)} TaskRuns in namespace '{namespace}'")

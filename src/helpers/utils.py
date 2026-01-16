@@ -29,20 +29,30 @@ except ImportError:
 logger = logging.getLogger("lumino-mcp")
 
 
-def calculate_duration(start_time, end_time) -> str:
+def calculate_duration(start_time, end_time, use_current_if_missing: bool = False) -> str:
     """
     Calculate duration between two timestamps.
 
     Args:
         start_time: Start timestamp (string or datetime)
-        end_time: End timestamp (string or datetime)
+        end_time: End timestamp (string or datetime), can be None for running tasks
+        use_current_if_missing: If True and end_time is missing, use current time (for running pipelines)
 
     Returns:
         str: Human-readable duration string (e.g., "5.32 minutes", "1.25 hours")
-             Returns "unknown" if timestamps are invalid or missing.
+             For running pipelines: "5.32 minutes (running)"
+             Returns "unknown" if start_time is invalid or missing.
     """
-    if not start_time or not end_time or start_time == "unknown" or end_time == "unknown":
+    if not start_time or start_time == "unknown":
         return "unknown"
+
+    is_running = False
+    if not end_time or end_time == "unknown":
+        if use_current_if_missing:
+            end_time = datetime.now(tz=None)
+            is_running = True
+        else:
+            return "unknown"
 
     try:
         if isinstance(start_time, str):
@@ -52,6 +62,13 @@ def calculate_duration(start_time, end_time) -> str:
 
         if isinstance(end_time, str):
             end = datetime.fromisoformat(end_time.replace("Z", "+00:00"))
+        elif isinstance(end_time, datetime):
+            # Make timezone-aware if start is timezone-aware
+            if start.tzinfo is not None and end_time.tzinfo is None:
+                from datetime import timezone
+                end = end_time.replace(tzinfo=timezone.utc)
+            else:
+                end = end_time
         else:
             end = end_time
 
@@ -59,13 +76,66 @@ def calculate_duration(start_time, end_time) -> str:
         seconds = duration.total_seconds()
 
         if seconds < 60:
-            return f"{seconds:.2f} seconds"
+            duration_str = f"{seconds:.2f} seconds"
         elif seconds < 3600:
-            return f"{seconds/60:.2f} minutes"
+            duration_str = f"{seconds/60:.2f} minutes"
+        elif seconds < 86400:
+            duration_str = f"{seconds/3600:.2f} hours"
         else:
-            return f"{seconds/3600:.2f} hours"
+            days = int(seconds // 86400)
+            remaining_hours = (seconds % 86400) / 3600
+            duration_str = f"{days}d {remaining_hours:.1f}h"
+
+        if is_running:
+            duration_str = f"{duration_str} (running)"
+
+        return duration_str
     except Exception:
         return "unknown"
+
+
+def calculate_duration_seconds(start_time, end_time, use_current_if_missing: bool = False) -> Optional[int]:
+    """
+    Calculate duration between two timestamps in seconds.
+
+    Args:
+        start_time: Start timestamp (string or datetime)
+        end_time: End timestamp (string or datetime), can be None for running tasks
+        use_current_if_missing: If True and end_time is missing, use current time
+
+    Returns:
+        int: Duration in seconds, or None if timestamps are invalid.
+    """
+    if not start_time or start_time == "unknown":
+        return None
+
+    if not end_time or end_time == "unknown":
+        if use_current_if_missing:
+            end_time = datetime.now(tz=None)
+        else:
+            return None
+
+    try:
+        if isinstance(start_time, str):
+            start = datetime.fromisoformat(start_time.replace("Z", "+00:00"))
+        else:
+            start = start_time
+
+        if isinstance(end_time, str):
+            end = datetime.fromisoformat(end_time.replace("Z", "+00:00"))
+        elif isinstance(end_time, datetime):
+            if start.tzinfo is not None and end_time.tzinfo is None:
+                from datetime import timezone
+                end = end_time.replace(tzinfo=timezone.utc)
+            else:
+                end = end_time
+        else:
+            end = end_time
+
+        duration = end - start
+        return int(duration.total_seconds())
+    except Exception:
+        return None
 
 
 def parse_time_period(time_period: str) -> timedelta:
