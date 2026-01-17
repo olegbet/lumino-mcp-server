@@ -603,15 +603,15 @@ def _build_log_params(search_params: Dict[str, Any]) -> Dict[str, Any]:
 
 
 async def _get_target_namespaces(
-    clusters: Optional[List[str]],
+    namespaces: Optional[List[str]],
     identified_components: List[str],
     list_namespaces,
     detect_tekton_namespaces_func
 ) -> List[str]:
-    """Determine target namespaces based on clusters and identified components."""
-    if clusters:
-        # If specific clusters provided, use them
-        return clusters
+    """Determine target namespaces based on provided namespaces and identified components."""
+    if namespaces:
+        # If specific namespaces provided, use them directly
+        return namespaces
 
     # Auto-detect relevant namespaces based on components
     all_namespaces = await list_namespaces()
@@ -676,18 +676,30 @@ async def _search_pod_logs_semantically(
         if not pod_logs or 'error' in pod_logs:
             return results
 
-        logs_list = pod_logs.get('logs', {}).get(pod_name, [])
-        if not logs_list:
+        # Logs are keyed by container name, not pod name
+        logs_dict = pod_logs.get('logs', {})
+        if not logs_dict:
             return results
 
-        # Convert list of log lines to a single string
-        logs_content = '\n'.join(logs_list) if isinstance(logs_list, list) else str(logs_list)
+        # Combine logs from all containers in this pod
+        all_logs_lines = []
+        for container_name, container_logs in logs_dict.items():
+            if isinstance(container_logs, list):
+                all_logs_lines.extend(container_logs)
+            elif isinstance(container_logs, str):
+                all_logs_lines.extend(container_logs.split('\n'))
+
+        if not all_logs_lines:
+            return results
+
+        logs_lines = all_logs_lines
 
         # Perform semantic matching on logs
         matches = find_semantic_matches_func(
-            logs_content,
-            query_interpretation,
-            search_params['context_lines']
+            logs_lines,
+            query_interpretation.get('semantic_keywords', []),
+            query_interpretation.get('interpreted_intent', 'general_search'),
+            search_params.get('max_results', 50)
         )
 
         for match in matches:
@@ -701,12 +713,12 @@ async def _search_pod_logs_semantically(
                 },
                 "log_entry": {
                     "timestamp": match.get('timestamp', 'unknown'),
-                    "level": match.get('level', 'info'),
-                    "message": match['message'],
-                    "context_lines": match.get('context_lines', [])
+                    "level": match.get('log_level', 'info'),
+                    "message": match.get('content', ''),
+                    "line_number": match.get('line_number', 0)
                 },
-                "relevance_score": match['relevance_score'],
-                "match_reasons": match['match_reasons'],
+                "relevance_score": match.get('relevance_score', 0),
+                "match_reasons": match.get('match_reasons', []),
                 "related_entries": match.get('related_count', 0)
             })
 

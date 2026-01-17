@@ -9586,7 +9586,7 @@ async def resource_bottleneck_forecaster(
 async def semantic_log_search(
     query: str,
     time_range: str = "1h",
-    clusters: Optional[List[str]] = None,
+    namespaces: Optional[List[str]] = None,
     severity_levels: Optional[List[str]] = None,
     max_results: int = 100,
     context_lines: int = 3,
@@ -9600,7 +9600,7 @@ async def semantic_log_search(
     Args:
         query: Natural language query describing what to search for.
         time_range: Time range - "1h", "6h", "24h", "7d" (default: "1h").
-        clusters: Specific clusters to search (default: all).
+        namespaces: Specific namespaces to search (default: auto-detect relevant namespaces).
         severity_levels: Log severity levels to include.
         max_results: Maximum results to return (default: 100).
         context_lines: Surrounding lines per match (default: 3).
@@ -9626,7 +9626,7 @@ async def semantic_log_search(
 
         # === Build Search Parameters ===
         search_params = {
-            'namespaces': await _get_target_namespaces(clusters, identified_components, list_namespaces, detect_tekton_namespaces),
+            'namespaces': await _get_target_namespaces(namespaces, identified_components, list_namespaces, detect_tekton_namespaces),
             'time_range': time_range,
             'severity_levels': severity_levels or ['error', 'warn', 'info', 'debug'],
             'max_results': max_results,
