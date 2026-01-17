@@ -9840,8 +9840,12 @@ async def what_if_scenario_simulator(
         # Build system behavior models
         behavior_models = await build_system_behavior_models(baseline_data, scenario_type)
 
-        # Load historical performance data for calibration
-        historical_data = await load_historical_performance_data(scope, simulation_duration)
+        # Load historical performance data for calibration (using real Prometheus data)
+        historical_data = await load_historical_performance_data(
+            scope,
+            simulation_duration,
+            prometheus_query_fn=_execute_prometheus_query_internal
+        )
 
         # Calibrate simulation models with historical data
         calibrated_models = calibrate_simulation_models(behavior_models, historical_data, load_profile)

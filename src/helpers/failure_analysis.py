@@ -1003,22 +1003,61 @@ def calculate_simulation_quality(
 ) -> Dict[str, Any]:
     """Calculate quality metrics for the simulation."""
     try:
-        # Model accuracy based on available data
-        data_points = len(historical_data.get("cpu_utilization", []))
-        if data_points >= 168:
-            model_accuracy = 0.9
-        elif data_points >= 24:
-            model_accuracy = 0.75
-        elif data_points >= 1:
-            model_accuracy = 0.5
+        # Determine data source (prometheus vs synthetic)
+        data_source = historical_data.get("data_source", "unknown")
+        is_real_data = data_source == "prometheus"
+
+        # Count all available data points across all metrics
+        metric_keys = ["cpu_utilization", "memory_utilization", "response_times",
+                       "error_rates", "throughput", "pipeline_durations"]
+        data_points_by_metric = {}
+        total_data_points = 0
+
+        for metric in metric_keys:
+            count = len(historical_data.get(metric, []))
+            if count > 0:
+                data_points_by_metric[metric] = count
+                total_data_points += count
+
+        # Use the max data points from any single metric for accuracy calculation
+        max_metric_points = max(data_points_by_metric.values()) if data_points_by_metric else 0
+
+        # Model accuracy - higher for real Prometheus data
+        if is_real_data:
+            # Real data gets a boost in accuracy
+            if max_metric_points >= 10:
+                model_accuracy = 0.92
+            elif max_metric_points >= 5:
+                model_accuracy = 0.85
+            elif max_metric_points >= 1:
+                model_accuracy = 0.75
+            else:
+                model_accuracy = 0.5
         else:
-            model_accuracy = 0.3
+            # Synthetic data has lower accuracy
+            if max_metric_points >= 168:
+                model_accuracy = 0.6  # Synthetic is always less reliable
+            elif max_metric_points >= 24:
+                model_accuracy = 0.5
+            elif max_metric_points >= 1:
+                model_accuracy = 0.4
+            else:
+                model_accuracy = 0.3
 
         # Data completeness based on baseline collection
         namespaces_analyzed = len(baseline_data.get("resource_usage", {}))
         nodes_analyzed = len(baseline_data.get("cluster_nodes", []))
 
-        data_completeness = min(1.0, (namespaces_analyzed * 0.1 + nodes_analyzed * 0.05))
+        # Calculate completeness with more weight on real metrics
+        metrics_with_data = len(data_points_by_metric)
+        metric_coverage = metrics_with_data / len(metric_keys) if metric_keys else 0
+
+        data_completeness = min(1.0, (
+            namespaces_analyzed * 0.05 +
+            nodes_analyzed * 0.03 +
+            metric_coverage * 0.5 +
+            (0.3 if is_real_data else 0)
+        ))
 
         # Identify assumptions and limitations
         assumptions = [
@@ -1027,14 +1066,29 @@ def calculate_simulation_quality(
             "No external dependencies or constraints considered"
         ]
 
-        limitations = [
-            f"Simulation based on {data_points} historical data points",
-            f"Analysis limited to {namespaces_analyzed} namespaces",
-            "Monte Carlo simulation uses simplified models"
-        ]
+        if is_real_data:
+            assumptions.insert(0, "Using real-time Prometheus metrics from cluster")
+
+        limitations = []
+
+        # Add data source information
+        if is_real_data:
+            limitations.append(f"Analysis based on {total_data_points} real Prometheus data points")
+            limitations.append(f"Metrics collected: {', '.join(data_points_by_metric.keys())}")
+        else:
+            limitations.append(f"Simulation based on {max_metric_points} synthetic data points")
+            if data_source == "synthetic_fallback":
+                limitations.append("Prometheus queries returned no data - using synthetic fallback")
+            elif data_source == "synthetic_error_fallback":
+                limitations.append(f"Prometheus query error - using synthetic fallback: {historical_data.get('error', 'unknown')}")
+
+        limitations.append(f"Analysis covers {namespaces_analyzed} namespaces and {nodes_analyzed} nodes")
+
+        if not is_real_data:
+            limitations.append("Monte Carlo simulation uses simplified models with synthetic data")
 
         if model_accuracy < 0.7:
-            limitations.append("Limited historical data may reduce prediction accuracy")
+            limitations.append("Limited data availability may reduce prediction accuracy")
 
         if data_completeness < 0.5:
             limitations.append("Incomplete baseline data may affect simulation quality")
@@ -1042,6 +1096,11 @@ def calculate_simulation_quality(
         return {
             "model_accuracy": round(model_accuracy, 2),
             "data_completeness": round(data_completeness, 2),
+            "data_source": data_source,
+            "total_data_points": total_data_points,
+            "metrics_collected": data_points_by_metric,
+            "namespaces_analyzed": namespaces_analyzed,
+            "nodes_analyzed": nodes_analyzed,
             "assumptions": assumptions,
             "limitations": limitations,
             "overall_quality": round((model_accuracy + data_completeness) / 2, 2)
@@ -1053,6 +1112,8 @@ def calculate_simulation_quality(
         return {
             "model_accuracy": 0.0,
             "data_completeness": 0.0,
+            "data_source": "error",
+            "total_data_points": 0,
             "assumptions": ["Simulation quality calculation failed"],
             "limitations": [f"Quality assessment error: {str(e)}"],
             "overall_quality": 0.0

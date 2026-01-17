@@ -1948,7 +1948,7 @@ async def collect_baseline_system_data(
     scope: Dict[str, Any],
     k8s_core_api,
     list_namespaces,
-    list_pods
+    list_pods_fn
 ) -> Dict[str, Any]:
     """Collect current system state as baseline for simulation."""
     from kubernetes.client.rest import ApiException
@@ -1967,11 +1967,14 @@ async def collect_baseline_system_data(
         else:
             namespaces = scope.get("namespaces", [])
 
+        logger.info(f"Collecting baseline data for {len(namespaces)} namespaces (analyzing first 10)")
+
         # Collect resource usage data
         for namespace in namespaces[:10]:  # Limit to prevent timeout
             try:
                 # Get pods and their resource usage
-                pods = await list_pods(namespace)
+                # list_pods requires (namespace, k8s_core_api, logger)
+                pods = await list_pods_fn(namespace, k8s_core_api, logger)
 
                 namespace_resources = {
                     "cpu_requests": 0,
@@ -2022,15 +2025,21 @@ async def collect_baseline_system_data(
                 node_data.append(node_info)
 
             baseline["cluster_nodes"] = node_data
+            logger.info(f"Collected data for {len(node_data)} nodes")
 
         except ApiException as e:
             logger.warning(f"Error collecting node data: {e}")
             baseline["cluster_nodes"] = []
 
+        # Log collection summary
+        namespaces_collected = len(baseline.get("resource_usage", {}))
+        nodes_collected = len(baseline.get("cluster_nodes", []))
+        logger.info(f"Baseline data collection complete: {namespaces_collected} namespaces, {nodes_collected} nodes")
+
         return baseline
 
     except Exception as e:
-        logger.error(f"Error collecting baseline system data: {e}")
+        logger.error(f"Error collecting baseline system data: {e}", exc_info=True)
         return {"error": str(e)}
 
 
@@ -2107,60 +2116,286 @@ async def build_system_behavior_models(
 
 async def load_historical_performance_data(
     scope: Dict[str, Any],
-    duration: str
+    duration: str,
+    prometheus_query_fn=None
 ) -> Dict[str, Any]:
-    """Load historical performance data for model calibration."""
-    import random
-    import math
+    """
+    Load historical performance data for model calibration from Prometheus.
 
+    Args:
+        scope: Simulation scope with namespaces/clusters to analyze
+        duration: Time duration for historical data (e.g., "24h", "7d")
+        prometheus_query_fn: Async function to execute Prometheus queries.
+                            Expected signature: async fn(query: str) -> Dict with 'success', 'data', 'error'
+
+    Returns:
+        Dict with historical metrics arrays and statistics
+    """
     try:
-        # Convert duration to hours for simulation
+        # Convert duration to hours for queries
         duration_hours = convert_duration_to_hours(duration)
+        duration_str = f"{duration_hours}h"
 
-        # Generate synthetic historical data based on common patterns
+        # Initialize historical data structure
         historical = {
             "cpu_utilization": [],
             "memory_utilization": [],
             "response_times": [],
             "error_rates": [],
-            "throughput": []
+            "throughput": [],
+            "pipeline_durations": [],
+            "data_source": "prometheus" if prometheus_query_fn else "synthetic"
         }
 
-        # Generate hourly data points
-        for hour in range(min(168, duration_hours)):  # Max 1 week of hourly data
-            # Simulate daily patterns (higher during business hours)
-            hour_of_day = hour % 24
-            business_hours_factor = 1.0 + 0.5 * math.sin(math.pi * (hour_of_day - 6) / 12)
-            business_hours_factor = max(0.3, business_hours_factor)
+        # If no Prometheus function provided, fall back to synthetic data
+        if prometheus_query_fn is None:
+            logger.warning("No Prometheus query function provided, using synthetic data")
+            return await _generate_synthetic_historical_data(duration_hours)
 
-            # Add some randomness
-            noise = random.gauss(1.0, 0.1)
+        logger.info(f"Loading historical performance data from Prometheus for {duration_str}")
 
-            # Generate metrics with realistic correlations
-            base_cpu = 45 * business_hours_factor * noise
-            base_memory = 60 * business_hours_factor * noise
-            base_response = 150 * (1 + 0.5 * (base_cpu / 100))
-            base_errors = max(0.1, 2.0 * (base_cpu / 100) ** 2)
-            base_throughput = 1000 * business_hours_factor * (1 - base_errors / 100)
+        # Build namespace filter for queries
+        namespaces = scope.get("namespaces", ["all"])
+        namespace_regex = ""
+        if namespaces != ["all"] and namespaces:
+            namespace_regex = "|".join(namespaces[:10])  # Limit to prevent huge queries
 
-            historical["cpu_utilization"].append(min(95, max(10, base_cpu)))
-            historical["memory_utilization"].append(min(90, max(20, base_memory)))
-            historical["response_times"].append(max(50, base_response))
-            historical["error_rates"].append(min(10, base_errors))
-            historical["throughput"].append(max(100, base_throughput))
+        # Query 1: CPU utilization over time (hourly averages)
+        # Using node-level CPU as percentage
+        cpu_query = f'''
+            avg by () (
+                100 - (avg by (instance) (rate(node_cpu_seconds_total{{mode="idle"}}[5m])) * 100)
+            )[{duration_str}:1h]
+        '''
+        # Fallback simpler query if range vector fails
+        cpu_query_simple = f'''
+            avg(100 - (avg by (instance) (rate(node_cpu_seconds_total{{mode="idle"}}[1h])) * 100))
+        '''
 
-        # Calculate statistics
-        for metric, values in historical.items():
-            if values:
+        cpu_result = await prometheus_query_fn(cpu_query_simple)
+        if cpu_result.get("success") and cpu_result.get("data"):
+            for result in cpu_result["data"]:
+                value = result.get("value", [None, None])
+                if len(value) > 1 and value[1]:
+                    try:
+                        cpu_val = float(value[1])
+                        historical["cpu_utilization"].append(cpu_val)
+                    except (ValueError, TypeError):
+                        pass
+
+        # Query 2: Memory utilization
+        memory_query = f'''
+            avg(
+                (1 - (node_memory_MemAvailable_bytes / node_memory_MemTotal_bytes)) * 100
+            )
+        '''
+
+        memory_result = await prometheus_query_fn(memory_query)
+        if memory_result.get("success") and memory_result.get("data"):
+            for result in memory_result["data"]:
+                value = result.get("value", [None, None])
+                if len(value) > 1 and value[1]:
+                    try:
+                        mem_val = float(value[1])
+                        historical["memory_utilization"].append(mem_val)
+                    except (ValueError, TypeError):
+                        pass
+
+        # Query 3: Pipeline throughput (pipelines per hour)
+        throughput_query = f'''
+            sum(increase(tekton_pipelines_controller_pipelinerun_count[1h]))
+        '''
+
+        throughput_result = await prometheus_query_fn(throughput_query)
+        if throughput_result.get("success") and throughput_result.get("data"):
+            for result in throughput_result["data"]:
+                value = result.get("value", [None, None])
+                if len(value) > 1 and value[1]:
+                    try:
+                        tput_val = float(value[1])
+                        historical["throughput"].append(tput_val)
+                    except (ValueError, TypeError):
+                        pass
+
+        # Query 4: Pipeline error rates
+        error_rate_query = f'''
+            sum(rate(tekton_pipelines_controller_pipelinerun_count{{status="failed"}}[1h])) /
+            sum(rate(tekton_pipelines_controller_pipelinerun_count[1h])) * 100
+        '''
+
+        error_result = await prometheus_query_fn(error_rate_query)
+        if error_result.get("success") and error_result.get("data"):
+            for result in error_result["data"]:
+                value = result.get("value", [None, None])
+                if len(value) > 1 and value[1]:
+                    try:
+                        err_val = float(value[1])
+                        if not (err_val != err_val):  # Check for NaN
+                            historical["error_rates"].append(err_val)
+                    except (ValueError, TypeError):
+                        pass
+
+        # Query 5: Pipeline duration P50 (response times)
+        duration_query = f'''
+            histogram_quantile(0.50,
+                sum(rate(tekton_pipelines_controller_pipelinerun_duration_seconds_bucket[1h])) by (le)
+            )
+        '''
+
+        duration_result = await prometheus_query_fn(duration_query)
+        if duration_result.get("success") and duration_result.get("data"):
+            for result in duration_result["data"]:
+                value = result.get("value", [None, None])
+                if len(value) > 1 and value[1]:
+                    try:
+                        dur_val = float(value[1])
+                        if dur_val > 0 and not (dur_val != dur_val):  # Valid and not NaN
+                            historical["response_times"].append(dur_val)
+                            historical["pipeline_durations"].append(dur_val)
+                    except (ValueError, TypeError):
+                        pass
+
+        # If we got no data from Prometheus, try alternate queries
+        if not any([historical["cpu_utilization"], historical["memory_utilization"],
+                    historical["throughput"]]):
+            logger.warning("Primary Prometheus queries returned no data, trying alternate queries")
+
+            # Try container-level CPU usage
+            alt_cpu_query = '''
+                avg(rate(container_cpu_usage_seconds_total{container!=""}[5m])) * 100
+            '''
+            alt_cpu_result = await prometheus_query_fn(alt_cpu_query)
+            if alt_cpu_result.get("success") and alt_cpu_result.get("data"):
+                for result in alt_cpu_result["data"]:
+                    value = result.get("value", [None, None])
+                    if len(value) > 1 and value[1]:
+                        try:
+                            historical["cpu_utilization"].append(float(value[1]))
+                        except (ValueError, TypeError):
+                            pass
+
+            # Try container memory usage
+            alt_memory_query = '''
+                sum(container_memory_working_set_bytes{container!=""}) /
+                sum(machine_memory_bytes) * 100
+            '''
+            alt_memory_result = await prometheus_query_fn(alt_memory_query)
+            if alt_memory_result.get("success") and alt_memory_result.get("data"):
+                for result in alt_memory_result["data"]:
+                    value = result.get("value", [None, None])
+                    if len(value) > 1 and value[1]:
+                        try:
+                            historical["memory_utilization"].append(float(value[1]))
+                        except (ValueError, TypeError):
+                            pass
+
+            # Try tekton taskrun count as throughput proxy
+            alt_throughput_query = '''
+                sum(increase(tekton_pipelines_controller_taskrun_count[1h]))
+            '''
+            alt_throughput_result = await prometheus_query_fn(alt_throughput_query)
+            if alt_throughput_result.get("success") and alt_throughput_result.get("data"):
+                for result in alt_throughput_result["data"]:
+                    value = result.get("value", [None, None])
+                    if len(value) > 1 and value[1]:
+                        try:
+                            # Convert taskruns to estimated pipelines (divide by avg tasks per pipeline)
+                            taskruns = float(value[1])
+                            estimated_pipelines = taskruns / 5.0  # Assume 5 tasks per pipeline average
+                            historical["throughput"].append(estimated_pipelines)
+                        except (ValueError, TypeError):
+                            pass
+
+        # Log data collection results
+        data_summary = {k: len(v) for k, v in historical.items() if isinstance(v, list)}
+        logger.info(f"Historical data collected: {data_summary}")
+
+        # If still no data, generate synthetic as fallback but mark it
+        total_data_points = sum(len(v) for v in historical.values() if isinstance(v, list))
+        if total_data_points == 0:
+            logger.warning("No Prometheus data available, falling back to synthetic data")
+            synthetic = await _generate_synthetic_historical_data(duration_hours)
+            synthetic["data_source"] = "synthetic_fallback"
+            synthetic["prometheus_queries_attempted"] = True
+            return synthetic
+
+        # Calculate statistics for each metric
+        for metric in ["cpu_utilization", "memory_utilization", "response_times",
+                       "error_rates", "throughput", "pipeline_durations"]:
+            values = historical.get(metric, [])
+            if values and len(values) > 0:
                 historical[f"{metric}_stats"] = {
                     "mean": sum(values) / len(values),
                     "min": min(values),
                     "max": max(values),
-                    "std_dev": calculate_std_dev(values)
+                    "std_dev": calculate_std_dev(values) if len(values) > 1 else 0,
+                    "count": len(values)
                 }
+
+        historical["collection_timestamp"] = datetime.now().isoformat()
+        historical["duration_queried"] = duration_str
 
         return historical
 
     except Exception as e:
-        logger.error(f"Error loading historical performance data: {e}")
-        return {"error": str(e)}
+        logger.error(f"Error loading historical performance data: {e}", exc_info=True)
+        # Return synthetic data as fallback with error info
+        fallback = await _generate_synthetic_historical_data(
+            convert_duration_to_hours(duration) if duration else 24
+        )
+        fallback["data_source"] = "synthetic_error_fallback"
+        fallback["error"] = str(e)
+        return fallback
+
+
+async def _generate_synthetic_historical_data(duration_hours: int) -> Dict[str, Any]:
+    """Generate synthetic historical data as fallback when Prometheus is unavailable."""
+    import random
+    import math
+
+    historical = {
+        "cpu_utilization": [],
+        "memory_utilization": [],
+        "response_times": [],
+        "error_rates": [],
+        "throughput": [],
+        "data_source": "synthetic"
+    }
+
+    # Generate hourly data points
+    for hour in range(min(168, duration_hours)):  # Max 1 week of hourly data
+        # Simulate daily patterns (higher during business hours)
+        hour_of_day = hour % 24
+        business_hours_factor = 1.0 + 0.5 * math.sin(math.pi * (hour_of_day - 6) / 12)
+        business_hours_factor = max(0.3, business_hours_factor)
+
+        # Add some randomness
+        noise = random.gauss(1.0, 0.1)
+
+        # Generate metrics with realistic correlations
+        base_cpu = 45 * business_hours_factor * noise
+        base_memory = 60 * business_hours_factor * noise
+        base_response = 150 * (1 + 0.5 * (base_cpu / 100))
+        base_errors = max(0.1, 2.0 * (base_cpu / 100) ** 2)
+        base_throughput = 1000 * business_hours_factor * (1 - base_errors / 100)
+
+        historical["cpu_utilization"].append(min(95, max(10, base_cpu)))
+        historical["memory_utilization"].append(min(90, max(20, base_memory)))
+        historical["response_times"].append(max(50, base_response))
+        historical["error_rates"].append(min(10, base_errors))
+        historical["throughput"].append(max(100, base_throughput))
+
+    # Calculate statistics
+    for metric in ["cpu_utilization", "memory_utilization", "response_times",
+                   "error_rates", "throughput"]:
+        values = historical.get(metric, [])
+        if values:
+            historical[f"{metric}_stats"] = {
+                "mean": sum(values) / len(values),
+                "min": min(values),
+                "max": max(values),
+                "std_dev": calculate_std_dev(values) if len(values) > 1 else 0,
+                "count": len(values)
+            }
+
+    return historical
