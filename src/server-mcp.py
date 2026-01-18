@@ -7742,15 +7742,46 @@ async def ci_cd_performance_baselining_tool(
             "data_source": "prometheus"
         }
 
-        # Query 1: Get TaskRun counts and durations by namespace and status
+        # Define all Prometheus queries upfront
         duration_count_query = "sum by (namespace, status) (tekton_pipelines_controller_pipelinerun_taskrun_duration_seconds_count)"
         duration_sum_query = "sum by (namespace, status) (tekton_pipelines_controller_pipelinerun_taskrun_duration_seconds_sum)"
+        avg_duration_query = "sum by (namespace) (tekton_pipelines_controller_pipelinerun_taskrun_duration_seconds_sum) / sum by (namespace) (tekton_pipelines_controller_pipelinerun_taskrun_duration_seconds_count)"
+        p16_query = "histogram_quantile(0.16, sum by (namespace, le) (rate(tekton_pipelines_controller_pipelinerun_taskrun_duration_seconds_bucket[1h])))"
+        p84_query = "histogram_quantile(0.84, sum by (namespace, le) (rate(tekton_pipelines_controller_pipelinerun_taskrun_duration_seconds_bucket[1h])))"
+        recent_avg_query = "sum by (namespace) (increase(tekton_pipelines_controller_pipelinerun_taskrun_duration_seconds_sum[24h])) / sum by (namespace) (increase(tekton_pipelines_controller_pipelinerun_taskrun_duration_seconds_count[24h]))"
+        historical_avg_query = f"sum by (namespace) (increase(tekton_pipelines_controller_pipelinerun_taskrun_duration_seconds_sum[{baseline_period}])) / sum by (namespace) (increase(tekton_pipelines_controller_pipelinerun_taskrun_duration_seconds_count[{baseline_period}]))"
+        recent_success_query = "sum by (namespace) (increase(tekton_pipelines_controller_pipelinerun_taskrun_duration_seconds_count{status='success'}[24h])) / sum by (namespace) (increase(tekton_pipelines_controller_pipelinerun_taskrun_duration_seconds_count[24h])) * 100"
+        historical_success_query = f"sum by (namespace) (increase(tekton_pipelines_controller_pipelinerun_taskrun_duration_seconds_count{{status='success'}}[{baseline_period}])) / sum by (namespace) (increase(tekton_pipelines_controller_pipelinerun_taskrun_duration_seconds_count[{baseline_period}])) * 100"
+        reconcile_query = "sum by (namespace_name, success) (rate(tekton_pipelines_controller_reconcile_count[1h]))"
 
-        logger.info("Querying Prometheus for Tekton pipeline metrics...")
+        logger.info("Querying Prometheus for Tekton pipeline metrics (10 queries in parallel)...")
 
-        # Execute queries in parallel
-        count_result = await _execute_prometheus_query_internal(duration_count_query)
-        sum_result = await _execute_prometheus_query_internal(duration_sum_query)
+        # Execute ALL queries in parallel for maximum performance
+        (
+            count_result,
+            sum_result,
+            avg_result,
+            p16_result,
+            p84_result,
+            recent_avg_result,
+            historical_avg_result,
+            recent_success_result,
+            historical_success_result,
+            reconcile_result
+        ) = await asyncio.gather(
+            _execute_prometheus_query_internal(duration_count_query),
+            _execute_prometheus_query_internal(duration_sum_query),
+            _execute_prometheus_query_internal(avg_duration_query),
+            _execute_prometheus_query_internal(p16_query),
+            _execute_prometheus_query_internal(p84_query),
+            _execute_prometheus_query_internal(recent_avg_query),
+            _execute_prometheus_query_internal(historical_avg_query),
+            _execute_prometheus_query_internal(recent_success_query),
+            _execute_prometheus_query_internal(historical_success_query),
+            _execute_prometheus_query_internal(reconcile_query)
+        )
+
+        logger.info("All Prometheus queries completed")
 
         if not count_result.get("success") or not sum_result.get("success"):
             logger.warning("Prometheus queries failed, falling back to Kubernetes API")
@@ -7792,10 +7823,7 @@ async def ci_cd_performance_baselining_tool(
             if namespace in namespace_stats:
                 namespace_stats[namespace]["total_duration_sum"] += duration_sum
 
-        # Query for average durations per namespace
-        avg_duration_query = "sum by (namespace) (tekton_pipelines_controller_pipelinerun_taskrun_duration_seconds_sum) / sum by (namespace) (tekton_pipelines_controller_pipelinerun_taskrun_duration_seconds_count)"
-        avg_result = await _execute_prometheus_query_internal(avg_duration_query)
-
+        # Process average duration data
         if avg_result.get("success"):
             for item in avg_result.get("data", []):
                 metric = item.get("metric", {})
@@ -7805,15 +7833,7 @@ async def ci_cd_performance_baselining_tool(
                 if namespace in namespace_stats and not np.isnan(avg_duration):
                     namespace_stats[namespace]["avg_duration"] = avg_duration
 
-        # Query for P16 and P84 percentiles to calculate actual standard deviation
-        # std ≈ (P84 - P16) / 2 for normal distributions
-        p16_query = "histogram_quantile(0.16, sum by (namespace, le) (rate(tekton_pipelines_controller_pipelinerun_taskrun_duration_seconds_bucket[1h])))"
-        p84_query = "histogram_quantile(0.84, sum by (namespace, le) (rate(tekton_pipelines_controller_pipelinerun_taskrun_duration_seconds_bucket[1h])))"
-
-        p16_result = await _execute_prometheus_query_internal(p16_query)
-        p84_result = await _execute_prometheus_query_internal(p84_query)
-
-        # Store percentile data for std deviation calculation
+        # Store percentile data for std deviation calculation (std ≈ (P84 - P16) / 2)
         percentile_data = {}
         if p16_result.get("success"):
             for item in p16_result.get("data", []):
@@ -7835,23 +7855,7 @@ async def ci_cd_performance_baselining_tool(
                 if not np.isnan(p84_val) and not np.isinf(p84_val):
                     percentile_data[namespace]["p84"] = p84_val
 
-        # Query for trend detection using range queries
-        # Compare recent performance (last 24h) vs historical baseline period
-        # This provides actual time-series trend analysis instead of heuristics
-        recent_avg_query = "sum by (namespace) (increase(tekton_pipelines_controller_pipelinerun_taskrun_duration_seconds_sum[24h])) / sum by (namespace) (increase(tekton_pipelines_controller_pipelinerun_taskrun_duration_seconds_count[24h]))"
-        historical_avg_query = f"sum by (namespace) (increase(tekton_pipelines_controller_pipelinerun_taskrun_duration_seconds_sum[{baseline_period}])) / sum by (namespace) (increase(tekton_pipelines_controller_pipelinerun_taskrun_duration_seconds_count[{baseline_period}]))"
-
-        recent_success_query = "sum by (namespace) (increase(tekton_pipelines_controller_pipelinerun_taskrun_duration_seconds_count{status='success'}[24h])) / sum by (namespace) (increase(tekton_pipelines_controller_pipelinerun_taskrun_duration_seconds_count[24h])) * 100"
-        historical_success_query = f"sum by (namespace) (increase(tekton_pipelines_controller_pipelinerun_taskrun_duration_seconds_count{{status='success'}}[{baseline_period}])) / sum by (namespace) (increase(tekton_pipelines_controller_pipelinerun_taskrun_duration_seconds_count[{baseline_period}])) * 100"
-
-        logger.info(f"Querying trend data: recent (24h) vs historical ({baseline_period})")
-
-        recent_avg_result = await _execute_prometheus_query_internal(recent_avg_query)
-        historical_avg_result = await _execute_prometheus_query_internal(historical_avg_query)
-        recent_success_result = await _execute_prometheus_query_internal(recent_success_query)
-        historical_success_result = await _execute_prometheus_query_internal(historical_success_query)
-
-        # Store trend data for each namespace
+        # Store trend data for each namespace (recent vs historical comparison)
         trend_data = {}
 
         # Process recent average duration
@@ -7897,10 +7901,6 @@ async def ci_cd_performance_baselining_tool(
                     trend_data[namespace] = {"recent_avg": 0, "historical_avg": 0, "recent_success": 0, "historical_success": 0}
                 if not np.isnan(val) and not np.isinf(val):
                     trend_data[namespace]["historical_success"] = val
-
-        # Query for reconciliation rates (success/failure rates per namespace)
-        reconcile_query = "sum by (namespace_name, success) (rate(tekton_pipelines_controller_reconcile_count[1h]))"
-        reconcile_result = await _execute_prometheus_query_internal(reconcile_query)
 
         reconcile_stats = {}
         if reconcile_result.get("success"):
