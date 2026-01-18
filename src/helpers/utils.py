@@ -479,8 +479,21 @@ async def get_all_pod_logs(
         }
 
         # Add optional time/line filtering parameters
+        # Note: Kubernetes Python client does NOT support since_time parameter
+        # (see https://github.com/kubernetes-client/python/issues/1351)
+        # We must convert since_time to since_seconds
         if since_time:
-            log_params['since'] = since_time
+            try:
+                # Parse RFC3339 timestamp and convert to seconds from now
+                from datetime import timezone
+                since_dt = datetime.fromisoformat(since_time.replace("Z", "+00:00"))
+                now = datetime.now(timezone.utc)
+                delta = now - since_dt
+                computed_since_seconds = max(1, int(delta.total_seconds()))
+                log_params['since_seconds'] = computed_since_seconds
+                logger.debug(f"Converted since_time '{since_time}' to since_seconds={computed_since_seconds}")
+            except Exception as e:
+                logger.warning(f"Failed to parse since_time '{since_time}': {e}, ignoring filter")
         elif since_seconds:
             log_params['since_seconds'] = since_seconds
         elif tail_lines:

@@ -1174,7 +1174,8 @@ async def get_pipelinerun_logs(
     since_seconds: Optional[int] = None,
     since_time: Optional[str] = None,
     timestamps: bool = True,
-    previous: bool = False
+    previous: bool = False,
+    max_token_budget: int = 120000
 ) -> Dict[str, Any]:
     """
     Fetch logs from all pods in a Tekton PipelineRun with adaptive volume management.
@@ -1190,9 +1191,10 @@ async def get_pipelinerun_logs(
         since_time: Logs newer than RFC3339 timestamp (optional).
         timestamps: Include timestamps (default: True).
         previous: Get logs from previous container instance (default: False).
+        max_token_budget: Maximum tokens for output (default: 120000). Applies to both adaptive and manual modes.
 
     Returns:
-        Dict[str, Any]: Pod names as keys, logs as values. Includes "_adaptive_metadata" in adaptive mode.
+        Dict[str, Any]: Pod names as keys, logs as values. Includes "_metadata" with processing info.
     """
     # Build log filtering info for logging
     filter_info = []
@@ -1240,8 +1242,8 @@ async def get_pipelinerun_logs(
         if use_adaptive_processing:
             logger.info(f"ADAPTIVE MODE activated for PipelineRun '{pipelinerun_name}' - {len(pod_names)} pods detected")
 
-            # Initialize adaptive processor
-            processor = AdaptiveLogProcessor(max_token_budget=120000)
+            # Initialize adaptive processor with configurable budget
+            processor = AdaptiveLogProcessor(max_token_budget=max_token_budget)
 
             # Prioritize pods (failed pods first, recent pods next)
             prioritized_pods = await _prioritize_pipeline_pods(pod_names, namespace)
@@ -1330,8 +1332,12 @@ async def get_pipelinerun_logs(
             }
 
         else:
-            # MANUAL MODE: Use specified parameters
+            # MANUAL MODE: Use specified parameters with token budget enforcement
             logger.info(f"MANUAL MODE for PipelineRun '{pipelinerun_name}' - using specified constraints")
+
+            # Initialize processor for token tracking in manual mode
+            processor = AdaptiveLogProcessor(max_token_budget=max_token_budget)
+            truncated_pods = 0
 
             async def fetch_pod_logs(pod_name):
                 try:
@@ -1349,7 +1355,7 @@ async def get_pipelinerun_logs(
                         container_name, logs = next(iter(pod_logs.items()))
                         if clean_logs:
                             logs = clean_pipeline_logs(logs)
-                        all_logs[pod_name] = logs
+                        return pod_name, logs
                     else:
                         formatted_logs = []
                         for container_name, logs in pod_logs.items():
@@ -1358,14 +1364,45 @@ async def get_pipelinerun_logs(
                             formatted_logs.append(f"--- Container: {container_name} ---")
                             formatted_logs.append(logs)
                             formatted_logs.append(f"--- End Container: {container_name} ---")
-                        all_logs[pod_name] = "\n".join(formatted_logs)
+                        return pod_name, "\n".join(formatted_logs)
                 except Exception as e:
                     logger.error(f"Error fetching logs for pod {pod_name}: {e}")
-                    all_logs[pod_name] = f"Error fetching logs for pod {pod_name}: {str(e)}"
+                    return pod_name, f"Error fetching logs for pod {pod_name}: {str(e)}"
 
             # Fetch logs concurrently for all pods
             log_tasks = [fetch_pod_logs(pod_name) for pod_name in pod_names]
-            await asyncio.gather(*log_tasks)
+            results = await asyncio.gather(*log_tasks)
+
+            # Apply token budget limiting to collected logs
+            for pod_name, logs in results:
+                remaining_budget = processor.get_remaining_budget()
+                actual_tokens = calculate_context_tokens(str(logs))
+
+                if actual_tokens > remaining_budget and remaining_budget > 0:
+                    # Truncate logs to fit within remaining budget
+                    logs, was_truncated = _truncate_logs_to_token_limit(
+                        logs, remaining_budget, pod_name
+                    )
+                    if was_truncated:
+                        truncated_pods += 1
+                    actual_tokens = calculate_context_tokens(str(logs))
+                elif remaining_budget <= 0:
+                    # Skip this pod entirely if budget exhausted
+                    logs = f"[Skipped - token budget exhausted]"
+                    actual_tokens = calculate_context_tokens(logs)
+
+                all_logs[pod_name] = logs
+                processor.record_usage(actual_tokens)
+
+            # Add metadata for manual mode
+            all_logs["_metadata"] = {
+                "mode": "manual",
+                "pods_processed": len(pod_names),
+                "pods_truncated": truncated_pods,
+                "token_budget_used": f"{processor.get_usage_percentage():.1f}%",
+                "token_budget_max": max_token_budget,
+                "filters_applied": filter_info if filter_info else ["none"]
+            }
 
         return all_logs
 
