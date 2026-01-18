@@ -2813,22 +2813,50 @@ async def get_tekton_pipeline_runs_status() -> str:
     try:
         logger.info("Fetching cluster-wide Tekton PipelineRuns and TaskRuns status")
 
-        # Fetch PipelineRuns cluster-wide
+        # Use limits to prevent timeout on large clusters
+        # Fetch PipelineRuns cluster-wide with limit
         pipeline_runs = k8s_custom_api.list_cluster_custom_object(
             group="tekton.dev",
             version="v1",
-            plural="pipelineruns"
+            plural="pipelineruns",
+            limit=500  # Limit to most recent 500 PipelineRuns
         )
 
-        # Fetch TaskRuns cluster-wide
-        task_runs = k8s_custom_api.list_cluster_custom_object(
-            group="tekton.dev",
-            version="v1",
-            plural="taskruns"
-        )
+        # For TaskRuns, only fetch from namespaces with active pipelines to avoid massive data
+        # Get unique namespaces from PipelineRuns
+        active_namespaces = set()
+        for pr in pipeline_runs.get('items', []):
+            ns = pr.get('metadata', {}).get('namespace')
+            if ns:
+                active_namespaces.add(ns)
+
+        # Fetch TaskRuns only from active namespaces with limits
+        task_runs_items = []
+        for ns in list(active_namespaces)[:20]:  # Limit to 20 namespaces
+            try:
+                ns_task_runs = k8s_custom_api.list_namespaced_custom_object(
+                    group="tekton.dev",
+                    version="v1",
+                    namespace=ns,
+                    plural="taskruns",
+                    limit=100  # Limit per namespace
+                )
+                task_runs_items.extend(ns_task_runs.get('items', []))
+            except Exception as e:
+                logger.debug(f"Error fetching TaskRuns from {ns}: {e}")
+                continue
+
+        task_runs = {'items': task_runs_items}
 
         analysis = {
             'timestamp': datetime.now().isoformat(),
+            'sampling_info': {
+                'pipeline_runs_limit': 500,
+                'task_runs_limit_per_namespace': 100,
+                'namespaces_sampled': len(active_namespaces),
+                'namespaces_limit': 20,
+                'note': 'Results are sampled to prevent timeout on large clusters'
+            },
             'pipeline_runs': {
                 'total': len(pipeline_runs.get('items', [])),
                 'by_status': {},
