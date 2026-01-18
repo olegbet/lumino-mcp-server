@@ -2435,13 +2435,42 @@ async def list_recent_pipeline_runs(limit: int = 10) -> Dict[str, List[Dict[str,
                         if conditions:
                             current_status = conditions[-1].get("reason", "Unknown")
 
+                        # Get pipeline name from multiple sources (same logic as list_pipelineruns)
+                        spec = pr.get("spec", {})
+                        labels = metadata.get("labels", {})
+                        pipeline_name = "unknown"
+
+                        # 1. Check spec.pipelineRef.name (direct reference)
+                        pipeline_ref = spec.get("pipelineRef", {})
+                        if pipeline_ref and pipeline_ref.get("name"):
+                            pipeline_name = pipeline_ref.get("name")
+
+                        # 2. Check common Tekton labels (used by Konflux)
+                        if pipeline_name == "unknown":
+                            pipeline_name = (
+                                labels.get("tekton.dev/pipeline") or
+                                labels.get("pipelines.tekton.dev/pipeline") or
+                                labels.get("pipelines.openshift.io/pipeline") or
+                                "unknown"
+                            )
+
+                        # 3. Check inline pipelineSpec
+                        if pipeline_name == "unknown":
+                            pipeline_spec = spec.get("pipelineSpec", {})
+                            if pipeline_spec:
+                                pipeline_name = (
+                                    pipeline_spec.get("displayName") or
+                                    pipeline_spec.get("name") or
+                                    "inline-pipeline"
+                                )
+
                         all_runs.append({
                             "namespace": namespace,
                             "name": metadata.get("name", "unknown"),
                             "start_time": start_time,
                             "status": current_status,
-                            "pipeline": pr.get("spec", {}).get("pipelineRef", {}).get("name", "unknown"),
-                            "labels": metadata.get("labels", {})
+                            "pipeline": pipeline_name,
+                            "labels": labels
                         })
 
             except ApiException as e:
