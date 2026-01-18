@@ -2800,15 +2800,30 @@ async def find_pipeline(pipeline_id_pattern: str) -> Dict[str, Any]:
 
 
 @mcp.tool()
-async def get_tekton_pipeline_runs_status() -> str:
+async def get_tekton_pipeline_runs_status(
+    pipeline_runs_limit: int = 500,
+    task_runs_limit_per_namespace: int = 100,
+    max_namespaces: int = 20,
+    recent_failures_limit: int = 10,
+    long_running_limit: int = 5
+) -> Dict[str, Any]:
     """
     Get cluster-wide status summary of all Tekton PipelineRuns and TaskRuns.
 
     Shows running/succeeded/failed counts, recent failures, and long-running pipelines (>1 hour).
 
+    Args:
+        pipeline_runs_limit: Max PipelineRuns to fetch cluster-wide (default: 500).
+        task_runs_limit_per_namespace: Max TaskRuns to fetch per namespace (default: 100).
+        max_namespaces: Max namespaces to scan for TaskRuns (default: 20).
+        recent_failures_limit: Max recent failures to include in output (default: 10).
+        long_running_limit: Max long-running pipelines to include (default: 5).
+
     Returns:
-        str: JSON with keys: timestamp, pipeline_runs (total, by_status, recent_failures, long_running),
-             task_runs (total, by_status, recent_failures), insights.
+        Dict[str, Any]: Keys: timestamp, sampling_info, pipeline_runs (total, by_status,
+                        recent_failures [top N], failures_by_namespace, long_running [top N]),
+                        task_runs (total, by_status, recent_failures [top N], failures_by_namespace),
+                        insights.
     """
     try:
         logger.info("Fetching cluster-wide Tekton PipelineRuns and TaskRuns status")
@@ -2819,7 +2834,7 @@ async def get_tekton_pipeline_runs_status() -> str:
             group="tekton.dev",
             version="v1",
             plural="pipelineruns",
-            limit=500  # Limit to most recent 500 PipelineRuns
+            limit=pipeline_runs_limit
         )
 
         # For TaskRuns, only fetch from namespaces with active pipelines to avoid massive data
@@ -2832,14 +2847,14 @@ async def get_tekton_pipeline_runs_status() -> str:
 
         # Fetch TaskRuns only from active namespaces with limits
         task_runs_items = []
-        for ns in list(active_namespaces)[:20]:  # Limit to 20 namespaces
+        for ns in list(active_namespaces)[:max_namespaces]:
             try:
                 ns_task_runs = k8s_custom_api.list_namespaced_custom_object(
                     group="tekton.dev",
                     version="v1",
                     namespace=ns,
                     plural="taskruns",
-                    limit=100  # Limit per namespace
+                    limit=task_runs_limit_per_namespace
                 )
                 task_runs_items.extend(ns_task_runs.get('items', []))
             except Exception as e:
@@ -2851,10 +2866,12 @@ async def get_tekton_pipeline_runs_status() -> str:
         analysis = {
             'timestamp': datetime.now().isoformat(),
             'sampling_info': {
-                'pipeline_runs_limit': 500,
-                'task_runs_limit_per_namespace': 100,
-                'namespaces_sampled': len(active_namespaces),
-                'namespaces_limit': 20,
+                'pipeline_runs_limit': pipeline_runs_limit,
+                'task_runs_limit_per_namespace': task_runs_limit_per_namespace,
+                'max_namespaces': max_namespaces,
+                'namespaces_sampled': min(len(active_namespaces), max_namespaces),
+                'recent_failures_limit': recent_failures_limit,
+                'long_running_limit': long_running_limit,
                 'note': 'Results are sampled to prevent timeout on large clusters'
             },
             'pipeline_runs': {
@@ -2942,19 +2959,60 @@ async def get_tekton_pipeline_runs_status() -> str:
                     }
                     analysis['task_runs']['recent_failures'].append(failure_info)
 
-        # Generate insights
+        # Aggregate failures by namespace for summary
+        pr_failures_by_namespace: Dict[str, int] = {}
+        for f in analysis['pipeline_runs']['recent_failures']:
+            ns = f.get('namespace', 'unknown')
+            pr_failures_by_namespace[ns] = pr_failures_by_namespace.get(ns, 0) + 1
+
+        tr_failures_by_namespace: Dict[str, int] = {}
+        for f in analysis['task_runs']['recent_failures']:
+            ns = f.get('namespace', 'unknown')
+            tr_failures_by_namespace[ns] = tr_failures_by_namespace.get(ns, 0) + 1
+
+        # Store total counts before truncating
         total_pr_failures = len(analysis['pipeline_runs']['recent_failures'])
         total_tr_failures = len(analysis['task_runs']['recent_failures'])
+        total_long_running = len(analysis['pipeline_runs']['long_running'])
 
+        # Sort failures by start_time (most recent first) and apply limit
+        analysis['pipeline_runs']['recent_failures'].sort(
+            key=lambda x: x.get('start_time', ''), reverse=True
+        )
+        analysis['pipeline_runs']['recent_failures'] = analysis['pipeline_runs']['recent_failures'][:recent_failures_limit]
+
+        analysis['task_runs']['recent_failures'].sort(
+            key=lambda x: x.get('start_time', ''), reverse=True
+        )
+        analysis['task_runs']['recent_failures'] = analysis['task_runs']['recent_failures'][:recent_failures_limit]
+
+        # Sort long_running by runtime (longest first) and apply limit
+        analysis['pipeline_runs']['long_running'].sort(
+            key=lambda x: x.get('runtime_hours', 0), reverse=True
+        )
+        analysis['pipeline_runs']['long_running'] = analysis['pipeline_runs']['long_running'][:long_running_limit]
+
+        # Add counts and aggregations
+        analysis['pipeline_runs']['total_failures'] = total_pr_failures
+        analysis['pipeline_runs']['failures_by_namespace'] = pr_failures_by_namespace
+        analysis['pipeline_runs']['total_long_running'] = total_long_running
+
+        analysis['task_runs']['total_failures'] = total_tr_failures
+        analysis['task_runs']['failures_by_namespace'] = tr_failures_by_namespace
+
+        # Generate insights
         if total_pr_failures > 0:
-            analysis['insights'].append(f"Found {total_pr_failures} failed PipelineRuns requiring investigation")
+            shown = min(total_pr_failures, recent_failures_limit)
+            analysis['insights'].append(f"Found {total_pr_failures} failed PipelineRuns (showing top {shown} most recent)")
 
         if total_tr_failures > 0:
-            analysis['insights'].append(f"Found {total_tr_failures} failed TaskRuns requiring investigation")
+            shown = min(total_tr_failures, recent_failures_limit)
+            analysis['insights'].append(f"Found {total_tr_failures} failed TaskRuns (showing top {shown} most recent)")
 
-        if len(analysis['pipeline_runs']['long_running']) > 0:
+        if total_long_running > 0:
+            shown = min(total_long_running, long_running_limit)
             analysis['insights'].append(
-                f"Found {len(analysis['pipeline_runs']['long_running'])} long-running pipelines (>1 hour)"
+                f"Found {total_long_running} long-running pipelines >1 hour (showing top {shown} longest)"
             )
 
         # Add summary insight
@@ -2965,24 +3023,22 @@ async def get_tekton_pipeline_runs_status() -> str:
             analysis['insights'].append(f"Pipeline success rate: {success_rate:.1f}%")
 
         logger.info(f"Tekton status analysis complete: {len(analysis['insights'])} insights generated")
-        return json.dumps(analysis, indent=2)
+        return analysis
 
     except ApiException as e:
-        error_response = {
+        logger.error(f"API error fetching Tekton resources: {e}")
+        return {
             'error': f"Kubernetes API error: {e.reason}",
             'status': e.status,
             'timestamp': datetime.now().isoformat()
         }
-        logger.error(f"API error fetching Tekton resources: {e}")
-        return json.dumps(error_response, indent=2)
 
     except Exception as e:
-        error_response = {
+        logger.error(f"Error fetching Tekton resources: {e}", exc_info=True)
+        return {
             'error': f"Failed to fetch Tekton resources: {str(e)}",
             'timestamp': datetime.now().isoformat()
         }
-        logger.error(f"Error fetching Tekton resources: {e}", exc_info=True)
-        return json.dumps(error_response, indent=2)
 
 
 @mcp.tool()
