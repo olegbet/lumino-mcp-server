@@ -7137,14 +7137,21 @@ async def check_cluster_certificate_health(
                 "warning_certificates": 0,
                 "critical_certificates": 0,
                 "expired_certificates": 0,
-                "scan_timestamp": datetime.utcnow().isoformat()
+                "scan_timestamp": datetime.utcnow().isoformat(),
+                "namespaces_scanned": 0,
+                "namespaces_skipped_rbac": 0,
+                "namespaces_total": 0
             },
             "certificate_details": [],
             "system_certificates": [],
             "expiration_timeline": [],
             "renewal_recommendations": [],
             "security_findings": [],
-            "certificate_authorities": []
+            "certificate_authorities": [],
+            "scan_coverage": {
+                "scanned_namespaces": [],
+                "skipped_namespaces_rbac": []
+            }
         }
 
         # Determine namespaces to scan
@@ -7165,12 +7172,15 @@ async def check_cluster_certificate_health(
 
         certificates_found = []
         ca_certificates = {}
+        scanned_namespaces = []
+        skipped_namespaces_rbac = []
 
         # Scan for TLS secrets in each namespace
         for namespace in target_namespaces:
             try:
                 logger.debug(f"Scanning namespace: {namespace}")
                 secrets = k8s_core_api.list_namespaced_secret(namespace)
+                scanned_namespaces.append(namespace)
 
                 for secret in secrets.items:
                     if not secret.data:
@@ -7247,6 +7257,7 @@ async def check_cluster_certificate_health(
             except ApiException as e:
                 if e.status == 403:
                     logger.debug(f"Access denied to namespace {namespace}: {e.reason}")
+                    skipped_namespaces_rbac.append(namespace)
                 else:
                     logger.warning(f"Error scanning namespace {namespace}: {e.reason}")
                 continue
@@ -7264,21 +7275,40 @@ async def check_cluster_certificate_health(
                 ]
 
                 for sys_ns in system_cert_namespaces:
-                    if sys_ns not in target_namespaces:
+                    if sys_ns not in scanned_namespaces:
                         try:
                             secrets = k8s_core_api.list_namespaced_secret(sys_ns)
+                            scanned_namespaces.append(sys_ns)
                             for secret in secrets.items:
-                                if secret.data and any(key in secret.data for key in ['tls.crt', 'ca.crt']):
-                                    result["system_certificates"].append({
-                                        "component": sys_ns.replace('openshift-', ''),
-                                        "certificate_purpose": secret.metadata.name,
-                                        "expiry_date": "Unknown",  # Would need parsing
-                                        "days_remaining": 0,
-                                        "status": "unknown",
-                                        "auto_renewal": True,  # OpenShift typically auto-renews
-                                        "renewal_mechanism": "OpenShift Certificate Operator"
-                                    })
-                        except ApiException:
+                                if secret.data:
+                                    for key in ['tls.crt', 'ca.crt']:
+                                        if key in secret.data:
+                                            try:
+                                                # Properly parse the certificate
+                                                cert_data = base64.b64decode(secret.data[key]).decode('utf-8')
+                                                if '-----BEGIN CERTIFICATE-----' in cert_data:
+                                                    cert_info = parse_certificate(cert_data)
+                                                    if cert_info:
+                                                        status = categorize_certificate_status(
+                                                            cert_info['days_remaining'],
+                                                            warning_threshold_days,
+                                                            critical_threshold_days
+                                                        )
+                                                        result["system_certificates"].append({
+                                                            "component": sys_ns.replace('openshift-', ''),
+                                                            "certificate_purpose": secret.metadata.name,
+                                                            "subject_cn": cert_info.get('subject_cn', 'Unknown'),
+                                                            "expiry_date": cert_info.get('not_after', 'Unknown'),
+                                                            "days_remaining": cert_info.get('days_remaining', 0),
+                                                            "status": status,
+                                                            "auto_renewal": True,
+                                                            "renewal_mechanism": "OpenShift Certificate Operator"
+                                                        })
+                                            except Exception as parse_err:
+                                                logger.debug(f"Could not parse system cert {secret.metadata.name}/{key}: {parse_err}")
+                        except ApiException as e:
+                            if e.status == 403:
+                                skipped_namespaces_rbac.append(sys_ns)
                             continue
 
             except Exception as e:
@@ -7296,8 +7326,27 @@ async def check_cluster_certificate_health(
             "healthy_certificates": healthy_count,
             "warning_certificates": warning_count,
             "critical_certificates": critical_count,
-            "expired_certificates": expired_count
+            "expired_certificates": expired_count,
+            "namespaces_scanned": len(scanned_namespaces),
+            "namespaces_skipped_rbac": len(skipped_namespaces_rbac),
+            "namespaces_total": len(target_namespaces)
         })
+
+        # Update scan coverage
+        result["scan_coverage"] = {
+            "scanned_namespaces": scanned_namespaces,
+            "skipped_namespaces_rbac": skipped_namespaces_rbac[:50]  # Limit to first 50 to avoid huge output
+        }
+
+        # Add RBAC warning if many namespaces were skipped
+        if len(skipped_namespaces_rbac) > len(scanned_namespaces):
+            result["security_findings"].append({
+                "type": "rbac_limitation",
+                "severity": "info",
+                "message": f"RBAC restrictions prevented scanning {len(skipped_namespaces_rbac)} namespaces. "
+                          f"Only {len(scanned_namespaces)} namespaces were accessible. "
+                          "Consider granting 'list secrets' permission for comprehensive certificate scanning."
+            })
 
         # Filter certificates by type if specified
         if certificate_types and "all" not in certificate_types:
