@@ -117,6 +117,7 @@ from helpers import (
     analyze_resource_constraints,
     analyze_configuration_issues,
     analyze_pipeline_dependencies,
+    analyze_pipeline_performance,
     generate_remediation_plan,
     calculate_confidence_score,
     assess_failure_severity,
@@ -6961,6 +6962,7 @@ async def advanced_event_analytics(
 @mcp.tool()
 async def automated_triage_rca_report_generator(
     failure_identifier: str,
+    namespace: Optional[str] = None,
     investigation_depth: str = "standard",
     include_related_failures: bool = True,
     time_window: str = "2h",
@@ -6974,6 +6976,7 @@ async def automated_triage_rca_report_generator(
 
     Args:
         failure_identifier: Pipeline run name, pod name, or failure event ID.
+        namespace: Optional namespace where the failure occurred. If not provided, searches across detected CI/CD namespaces.
         investigation_depth: "quick", "standard" (default), or "deep".
         include_related_failures: Analyze related recent failures (default: True).
         time_window: Time window for related events (default: "2h").
@@ -7023,34 +7026,34 @@ async def automated_triage_rca_report_generator(
             time_hours = int(time_window[:-1]) / 60
 
         # Step 1: Identify failure type and locate namespace
-        failure_context = await identify_failure_context(failure_identifier, detect_tekton_namespaces, k8s_custom_api, k8s_core_api, logger)
+        failure_context = await identify_failure_context(failure_identifier, detect_tekton_namespaces, k8s_custom_api, k8s_core_api, logger, namespace)
         if not failure_context["found"]:
             report["investigation_summary"]["failure_type"] = "Not Found"
             report["investigation_summary"]["severity"] = "Low"
             return report
 
-        namespace = failure_context["namespace"]
+        target_namespace = failure_context["namespace"]
         failure_type = failure_context["type"]
         report["investigation_summary"]["failure_type"] = failure_type
 
         # Step 2: Core failure analysis based on type
         if failure_type == "pipelinerun":
-            primary_analysis = await analyze_pipeline_failure(namespace, failure_identifier, investigation_depth, analyze_failed_pipeline, analyze_pipeline_performance, get_pod_logs, analyze_logs, detect_log_anomalies, analyze_pipeline_dependencies, logger)
+            primary_analysis = await analyze_pipeline_failure(target_namespace, failure_identifier, investigation_depth, analyze_failed_pipeline, analyze_pipeline_performance, get_pod_logs, analyze_logs, detect_log_anomalies, analyze_pipeline_dependencies, logger)
         elif failure_type == "pod":
-            primary_analysis = await analyze_pod_failure(namespace, failure_identifier, investigation_depth, k8s_core_api, get_pod_logs, analyze_logs, detect_log_anomalies, smart_get_namespace_events, logger)
+            primary_analysis = await analyze_pod_failure(target_namespace, failure_identifier, investigation_depth, k8s_core_api, get_pod_logs, analyze_logs, detect_log_anomalies, smart_get_namespace_events, logger)
         else:
-            primary_analysis = await analyze_generic_failure(namespace, failure_identifier, investigation_depth, smart_get_namespace_events, logger)
+            primary_analysis = await analyze_generic_failure(target_namespace, failure_identifier, investigation_depth, smart_get_namespace_events, logger)
 
         # Step 3: Build failure timeline
         timeline_events = []
         if generate_timeline:
-            timeline_events = await build_failure_timeline(namespace, failure_identifier, time_hours, smart_get_namespace_events, logger)
+            timeline_events = await build_failure_timeline(target_namespace, failure_identifier, time_hours, smart_get_namespace_events, logger)
             report["failure_timeline"] = timeline_events
 
         # Step 4: Correlate with related failures
         related_failures = []
         if include_related_failures:
-            related_failures = await find_related_failures(namespace, failure_identifier, time_hours, investigation_depth, list_pipelineruns, logger)
+            related_failures = await find_related_failures(target_namespace, failure_identifier, time_hours, investigation_depth, list_pipelineruns, logger)
             report["related_incidents"] = related_failures
 
         # Step 5: Advanced correlation and root cause analysis
@@ -7059,8 +7062,8 @@ async def automated_triage_rca_report_generator(
         )
 
         # Step 6: Resource and configuration analysis
-        resource_analysis = await analyze_resource_constraints(namespace, failure_identifier, k8s_core_api, logger)
-        config_analysis = await analyze_configuration_issues(namespace, failure_identifier, logger)
+        resource_analysis = await analyze_resource_constraints(target_namespace, failure_identifier, k8s_core_api, logger)
+        config_analysis = await analyze_configuration_issues(target_namespace, failure_identifier, logger)
 
         # Step 7: Compile comprehensive analysis
         report["root_cause_analysis"] = root_cause_data["root_cause_analysis"]

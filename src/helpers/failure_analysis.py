@@ -24,43 +24,57 @@ async def identify_failure_context(
     detect_tekton_namespaces_func,
     k8s_custom_api,
     k8s_core_api,
-    logger
+    logger,
+    namespace: str = None
 ) -> Dict[str, Any]:
-    """Identify the type and context of the failure."""
+    """Identify the type and context of the failure.
+
+    Args:
+        failure_identifier: Pipeline run name, pod name, or failure event ID.
+        detect_tekton_namespaces_func: Function to detect Tekton namespaces.
+        k8s_custom_api: Kubernetes custom objects API.
+        k8s_core_api: Kubernetes core API.
+        logger: Logger instance.
+        namespace: Optional namespace to search in. If provided, only searches this namespace.
+    """
     try:
-        # Try to find in different namespaces and types
-        tekton_namespaces = await detect_tekton_namespaces_func()
-        all_namespaces = []
-        for category in tekton_namespaces.values():
-            all_namespaces.extend(category)
+        # If namespace is provided, only search in that namespace
+        if namespace:
+            all_namespaces = [namespace]
+        else:
+            # Try to find in different namespaces and types
+            tekton_namespaces = await detect_tekton_namespaces_func()
+            all_namespaces = []
+            for category in tekton_namespaces.values():
+                all_namespaces.extend(category)
 
         # Check if it's a pipeline run
-        for namespace in all_namespaces:
+        for ns in all_namespaces:
             try:
                 pipeline_run = k8s_custom_api.get_namespaced_custom_object(
-                    group="tekton.dev", version="v1", namespace=namespace,
+                    group="tekton.dev", version="v1", namespace=ns,
                     plural="pipelineruns", name=failure_identifier
                 )
-                return {"found": True, "type": "pipelinerun", "namespace": namespace, "object": pipeline_run}
+                return {"found": True, "type": "pipelinerun", "namespace": ns, "object": pipeline_run}
             except ApiException:
                 continue
 
         # Check if it's a pod
-        for namespace in all_namespaces:
+        for ns in all_namespaces:
             try:
-                pod = k8s_core_api.read_namespaced_pod(name=failure_identifier, namespace=namespace)
-                return {"found": True, "type": "pod", "namespace": namespace, "object": pod}
+                pod = k8s_core_api.read_namespaced_pod(name=failure_identifier, namespace=ns)
+                return {"found": True, "type": "pod", "namespace": ns, "object": pod}
             except ApiException:
                 continue
 
         # Check if it's a task run
-        for namespace in all_namespaces:
+        for ns in all_namespaces:
             try:
                 task_run = k8s_custom_api.get_namespaced_custom_object(
-                    group="tekton.dev", version="v1", namespace=namespace,
+                    group="tekton.dev", version="v1", namespace=ns,
                     plural="taskruns", name=failure_identifier
                 )
-                return {"found": True, "type": "taskrun", "namespace": namespace, "object": task_run}
+                return {"found": True, "type": "taskrun", "namespace": ns, "object": task_run}
             except ApiException:
                 continue
 
@@ -406,6 +420,39 @@ async def analyze_configuration_issues(
     except Exception as e:
         logger.error(f"Error analyzing configuration: {str(e)}")
         return []
+
+
+async def analyze_pipeline_performance(
+    namespace: str,
+    limit: int = 50
+) -> Dict[str, Any]:
+    """Analyze pipeline performance for the given namespace.
+
+    Args:
+        namespace: Kubernetes namespace to analyze.
+        limit: Maximum number of pipeline runs to analyze.
+
+    Returns:
+        Dict with performance metrics and baselines.
+    """
+    try:
+        # Return basic structure - full implementation would use historical data
+        return {
+            "namespace": namespace,
+            "sample_size": 0,
+            "average_duration_seconds": None,
+            "success_rate": None,
+            "recent_trend": "unknown",
+            "performance_baselines": {},
+            "note": "Performance data analysis placeholder - requires historical pipeline data"
+        }
+
+    except Exception as e:
+        return {
+            "error": str(e),
+            "namespace": namespace
+        }
+
 
 async def analyze_pipeline_dependencies(
     namespace: str,

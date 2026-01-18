@@ -160,6 +160,7 @@ from .failure_analysis import (
     analyze_resource_constraints,
     analyze_configuration_issues,
     analyze_pipeline_dependencies,
+    analyze_pipeline_performance,
     # Remediation planning
     generate_remediation_plan,
     # Confidence and scoring
@@ -335,6 +336,7 @@ __all__ = [
     "analyze_resource_constraints",
     "analyze_configuration_issues",
     "analyze_pipeline_dependencies",
+    "analyze_pipeline_performance",
     "generate_remediation_plan",
     "calculate_confidence_score",
     "calculate_failure_impact_score",
