@@ -3024,12 +3024,19 @@ async def find_pipeline(
                     })
 
         # Process Repositories
+        # When namespaces filter is specified, only include repositories from those namespaces
         if "error" in repositories_resp:
             results["diagnostic_info"]["repositories_error"] = repositories_resp["error"]
         for repo in repositories_resp.get("items", []):
             namespace = repo.get("metadata", {}).get("namespace", "")
-            namespaces_seen.add(namespace)
             repo_name = repo.get("metadata", {}).get("name", "")
+
+            # Skip repositories not in the specified namespaces filter
+            if namespaces and namespace not in namespaces:
+                continue
+
+            # Only add to namespaces_seen if we're actually considering this repository
+            namespaces_seen.add(namespace)
 
             if pattern_lower in repo_name.lower():
                 spec = repo.get("spec", {})
@@ -3041,7 +3048,12 @@ async def find_pipeline(
                     "runs": status.get("runs", [])
                 })
 
-        results["all_namespaces_checked"] = sorted(namespaces_seen)
+        # Set all_namespaces_checked based on what was actually searched
+        # If namespaces filter was provided, show those; otherwise show discovered namespaces
+        if namespaces:
+            results["all_namespaces_checked"] = sorted(namespaces)
+        else:
+            results["all_namespaces_checked"] = sorted(namespaces_seen)
 
         # Add summary with sampling info
         results["summary"] = {
