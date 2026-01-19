@@ -37,6 +37,10 @@ class EventCategory(Enum):
     SCALING = "SCALING"
     LIFECYCLE = "LIFECYCLE"
     HEALTH = "HEALTH"
+    SECURITY = "SECURITY"
+    CONFIGURATION = "CONFIGURATION"
+    RESOURCE = "RESOURCE"
+    IMAGE = "IMAGE"
     OTHER = "OTHER"
 
 
@@ -631,10 +635,32 @@ class ProgressiveEventAnalyzer:
 # ============================================================================
 
 
+def extract_event_content_for_classification(event_str: str) -> str:
+    """
+    Extract the relevant content from an event string for classification.
+
+    Excludes the Object name (e.g., Pod/image-rbac-proxy-xxx) to avoid
+    false positive keyword matches on resource names.
+
+    Event format: [{timestamp}] {type}: {reason} - {message} (Object: {kind}/{name})
+    Returns: Just the type, reason, and message parts.
+    """
+    # Remove the Object suffix to avoid matching keywords in resource names
+    # Format: ... (Object: Kind/name)
+    if " (Object:" in event_str:
+        event_content = event_str.split(" (Object:")[0]
+    else:
+        event_content = event_str
+
+    return event_content
+
+
 def classify_event_severity_from_string(event_str: str) -> str:
     """Classify event severity from string representation."""
 
-    event_lower = event_str.lower()
+    # Extract just the event content, excluding object names
+    event_content = extract_event_content_for_classification(event_str)
+    event_lower = event_content.lower()
 
     # Check severity keywords from config
     for severity, keywords in SMART_EVENTS_CONFIG["severity_keywords"].items():
@@ -648,7 +674,9 @@ def classify_event_severity_from_string(event_str: str) -> str:
 def classify_event_category_from_string(event_str: str) -> str:
     """Classify event category from string representation."""
 
-    event_lower = event_str.lower()
+    # Extract just the event content, excluding object names
+    event_content = extract_event_content_for_classification(event_str)
+    event_lower = event_content.lower()
 
     # Check category keywords from config
     for category, keywords in SMART_EVENTS_CONFIG["category_keywords"].items():
@@ -663,7 +691,9 @@ def calculate_relevance_score_from_string(event_str: str, focus_areas: List[str]
     """Calculate relevance score based on focus areas."""
 
     score = 0.0
-    event_lower = event_str.lower()
+    # Extract just the event content, excluding object names
+    event_content = extract_event_content_for_classification(event_str)
+    event_lower = event_content.lower()
 
     # Base score from severity
     severity = classify_event_severity_from_string(event_str)
@@ -865,17 +895,26 @@ def generate_string_events_insights(classified_events: List[Dict[str, Any]]) -> 
         if time_span.total_seconds() < 3600:  # Less than 1 hour
             insights.append("Events clustered in short time window - potential incident burst")
 
-    # Pattern insights
-    all_text = " ".join([e.get("event_string", "") for e in classified_events]).lower()
+    # Pattern insights - use extracted content to avoid false positives from pod names
+    all_text = " ".join([
+        extract_event_content_for_classification(e.get("event_string", ""))
+        for e in classified_events
+    ]).lower()
 
     if "oom" in all_text:
         insights.append("Memory-related issues detected - check resource limits")
 
-    if "imagepull" in all_text:
+    if "imagepull" in all_text or "errimagepull" in all_text:
         insights.append("Image pull issues found - verify registry connectivity")
 
     if "timeout" in all_text:
         insights.append("Timeout patterns detected - investigate network latency")
+
+    if "failedmount" in all_text or "mount" in all_text and "failed" in all_text:
+        insights.append("Volume mount issues detected - check storage configuration")
+
+    if "createcontainerconfigerror" in all_text:
+        insights.append("Container configuration errors found - check configmaps and secrets")
 
     return insights
 
@@ -904,15 +943,27 @@ def generate_string_events_recommendations(classified_events: List[Dict[str, Any
     category_counts = Counter([e["category"] for e in classified_events])
 
     for category, count in category_counts.items():
-        if count >= 5:
+        if count >= 3:  # Lower threshold for actionable recommendations
             if category == "FAILURE":
                 recommendations.append("Review application stability and error handling mechanisms")
             elif category == "NETWORKING":
                 recommendations.append("Check network policies and service connectivity")
             elif category == "STORAGE":
-                recommendations.append("Verify storage backend health and capacity")
+                recommendations.append("Verify storage backend health and volume mounts")
             elif category == "SCHEDULING":
                 recommendations.append("Review node capacity and resource allocation")
+            elif category == "IMAGE":
+                recommendations.append("Check image registry connectivity and image names")
+            elif category == "CONFIGURATION":
+                recommendations.append("Verify configmaps and secrets are properly configured")
+            elif category == "RESOURCE":
+                recommendations.append("Review resource limits and requests for affected pods")
+            elif category == "SECURITY":
+                recommendations.append("Check RBAC permissions and security policies")
+            elif category == "SCALING":
+                recommendations.append("Review HPA configuration and scaling thresholds")
+            elif category == "HEALTH":
+                recommendations.append("Check probe configurations and application health endpoints")
 
     # General recommendations
     total_events = len(classified_events)

@@ -39,46 +39,61 @@ SMART_EVENTS_CONFIG: Dict[str, Any] = {
         ]
     },
     "category_keywords": {
+        # Order matters: more specific categories should come first
         "FAILURE": [
             "failed", "failure", "error", "crash", "panic", "exception",
-            "abort", "terminated", "killed", "died"
+            "abort", "terminated", "killed", "died", "backoff"
         ],
-        "NETWORKING": [
-            "network", "dns", "connection", "timeout", "unreachable",
-            "endpoint", "route", "ingress", "service"
+        "IMAGE": [
+            # IMAGE before SECURITY to avoid false positives with pod names like "image-rbac-proxy"
+            "imagepull", "pullimage", "errimagepull", "imagepullbackoff",
+            "pull image", "pulling image", "image pull", "registry"
         ],
         "STORAGE": [
             "volume", "disk", "storage", "mount", "pvc", "pv",
-            "filesystem", "space", "capacity"
+            "filesystem", "unmount", "failedmount", "failedattach"
         ],
-        "SCHEDULING": [
-            "schedule", "node", "resource", "capacity", "allocation",
-            "affinity", "taint", "toleration"
-        ],
-        "SECURITY": [
-            "permission", "auth", "forbidden", "unauthorized", "rbac",
-            "security", "policy", "scc"
-        ],
-        "CONFIGURATION": [
-            "config", "configmap", "secret", "env", "variable",
-            "setting", "parameter"
+        "NETWORKING": [
+            "network", "dns", "connection", "unreachable",
+            "endpoint", "route", "ingress", "addedinterface"
         ],
         "RESOURCE": [
-            "memory", "cpu", "oom", "limit", "request", "quota",
-            "resource", "utilization"
+            "memory", "cpu", "oom", "oomkilled", "quota exceeded",
+            "resource quota", "limitrange", "evicted"
         ],
-        "IMAGE": [
-            "image", "pull", "registry", "tag", "digest", "repository",
-            "imagepull", "pullimage"
+        "SCHEDULING": [
+            "scheduled", "unschedulable", "failedscheduling", "preempted",
+            "affinity", "taint", "toleration", "nodeaffinity"
+        ],
+        "CONFIGURATION": [
+            "configmap", "secret", "createcontainerconfigerror",
+            "invalidargument", "envvar"
+        ],
+        "SECURITY": [
+            "forbidden", "unauthorized", "accessdenied", "permission denied",
+            "securitycontext", "podsecurity", "scc violation"
+        ],
+        "SCALING": [
+            "scaled", "scaling", "replicas", "horizontalpodautoscaler",
+            "hpa", "scaleup", "scaledown"
+        ],
+        "LIFECYCLE": [
+            "created", "started", "stopped", "deleted", "killing",
+            "prestop", "poststart", "liveness", "readiness"
+        ],
+        "HEALTH": [
+            "healthy", "unhealthy", "probe", "livenessprobe", "readinessprobe",
+            "startupprobe", "health check"
         ]
     },
     "focus_area_mappings": {
         "errors": ["CRITICAL", "HIGH"],
         "warnings": ["MEDIUM"],
-        "failures": ["FAILURE", "NETWORKING", "STORAGE"],
-        "performance": ["RESOURCE", "SCHEDULING"],
-        "security": ["SECURITY", "CONFIGURATION"],
-        "infrastructure": ["SCHEDULING", "STORAGE", "NETWORKING"]
+        "failures": ["FAILURE", "NETWORKING", "STORAGE", "IMAGE", "CONFIGURATION"],
+        "performance": ["RESOURCE", "SCHEDULING", "SCALING"],
+        "security": ["SECURITY"],
+        "infrastructure": ["SCHEDULING", "STORAGE", "NETWORKING"],
+        "health": ["HEALTH", "LIFECYCLE"]
     }
 }
 
