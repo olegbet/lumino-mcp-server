@@ -282,6 +282,7 @@ try:
     k8s_custom_api = client.CustomObjectsApi()
     k8s_batch_api = client.BatchV1Api()
     k8s_storage_api = client.StorageV1Api()
+    k8s_autoscaling_api = client.AutoscalingV2Api()
 except Exception as e:
     logger.warning(f"Failed to initialize Kubernetes API clients: {e}")
     k8s_core_api = None
@@ -289,6 +290,7 @@ except Exception as e:
     k8s_custom_api = None
     k8s_batch_api = None
     k8s_storage_api = None
+    k8s_autoscaling_api = None
 
 
 # Prometheus endpoints configuration (local Tekton components)
@@ -1002,8 +1004,12 @@ def get_kubernetes_resource(
 
     Args:
         resource_type: Resource type. Supported: pod, service, configmap, secret, pvc, namespace, node,
-                       serviceaccount, deployment, replicaset, daemonset, statefulset, cronjob, ingress,
-                       pipelinerun, taskrun, pipeline, task, clustertask, podmonitor.
+                       serviceaccount, endpoints, event, persistentvolume, resourcequota, limitrange,
+                       deployment, replicaset, daemonset, statefulset, job, cronjob, ingress,
+                       storageclass, hpa (horizontalpodautoscaler),
+                       pipelinerun, taskrun, pipeline, task, clustertask,
+                       triggertemplate, triggerbinding, eventlistener,
+                       podmonitor, servicemonitor, prometheusrule, alertmanager.
         name: Resource name.
         namespace: Namespace (default: "default").
         output_format: "summary", "detailed", or "yaml" (default: "summary").
@@ -1024,7 +1030,13 @@ def get_kubernetes_resource(
             'persistentvolumeclaim': ('persistent_volume_claims', 'v1'),
             'namespace': ('namespaces', 'v1'),
             'node': ('nodes', 'v1'),
-            'serviceaccount': ('service_accounts', 'v1')
+            'serviceaccount': ('service_accounts', 'v1'),
+            'endpoints': ('endpoints', 'v1'),
+            'event': ('events', 'v1'),
+            'persistentvolume': ('persistent_volumes', 'v1'),
+            'pv': ('persistent_volumes', 'v1'),
+            'resourcequota': ('resource_quotas', 'v1'),
+            'limitrange': ('limit_ranges', 'v1')
         }
 
         apps_resources = {
@@ -1035,11 +1047,22 @@ def get_kubernetes_resource(
         }
 
         batch_resources = {
+            'job': ('jobs', 'batch/v1'),
             'cronjob': ('cron_jobs', 'batch/v1')
         }
 
         networking_resources = {
             'ingress': ('ingresses', 'networking.k8s.io/v1')
+        }
+
+        storage_resources = {
+            'storageclass': ('storage_classes', 'storage.k8s.io/v1'),
+            'sc': ('storage_classes', 'storage.k8s.io/v1')
+        }
+
+        autoscaling_resources = {
+            'horizontalpodautoscaler': ('horizontal_pod_autoscalers', 'autoscaling/v2'),
+            'hpa': ('horizontal_pod_autoscalers', 'autoscaling/v2')
         }
 
         tekton_resources = {
@@ -1050,8 +1073,17 @@ def get_kubernetes_resource(
             'clustertask': ('clustertasks', 'tekton.dev/v1beta1')
         }
 
+        tekton_triggers_resources = {
+            'triggertemplate': ('triggertemplates', 'triggers.tekton.dev/v1beta1'),
+            'triggerbinding': ('triggerbindings', 'triggers.tekton.dev/v1beta1'),
+            'eventlistener': ('eventlisteners', 'triggers.tekton.dev/v1beta1')
+        }
+
         monitoring_resources = {
-            'podmonitor': ('podmonitors', 'monitoring.coreos.com/v1')
+            'podmonitor': ('podmonitors', 'monitoring.coreos.com/v1'),
+            'servicemonitor': ('servicemonitors', 'monitoring.coreos.com/v1'),
+            'prometheusrule': ('prometheusrules', 'monitoring.coreos.com/v1'),
+            'alertmanager': ('alertmanagers', 'monitoring.coreos.com/v1')
         }
 
         admission_resources = {
@@ -1065,14 +1097,26 @@ def get_kubernetes_resource(
         # Fetch resource based on type
         if resource_type in core_resources:
             method_name, api_version = core_resources[resource_type]
-            if resource_type in ['namespace', 'node']:
+            if resource_type in ['namespace', 'node', 'persistentvolume', 'pv']:
                 # Cluster-scoped resources
                 method = getattr(k8s_core_api, f'read_{method_name[:-1]}')
                 resource_obj = method(name=name)
+            elif resource_type == 'endpoints':
+                # Endpoints uses plural form in method name
+                resource_obj = k8s_core_api.read_namespaced_endpoints(name=name, namespace=namespace)
             else:
                 # Namespaced resources
                 method = getattr(k8s_core_api, f'read_namespaced_{method_name[:-1]}')
                 resource_obj = method(name=name, namespace=namespace)
+
+        elif resource_type in storage_resources:
+            # Cluster-scoped storage resources
+            resource_obj = k8s_storage_api.read_storage_class(name=name)
+
+        elif resource_type in autoscaling_resources:
+            method_name, api_version = autoscaling_resources[resource_type]
+            method = getattr(k8s_autoscaling_api, f'read_namespaced_{method_name[:-1]}')
+            resource_obj = method(name=name, namespace=namespace)
 
         elif resource_type in apps_resources:
             method_name, api_version = apps_resources[resource_type]
@@ -1136,12 +1180,25 @@ def get_kubernetes_resource(
                     plural=method_name,
                     name=name
                 )
+
+        elif resource_type in tekton_triggers_resources:
+            method_name, api_version = tekton_triggers_resources[resource_type]
+            group, version = api_version.split('/')
+            resource_obj = k8s_custom_api.get_namespaced_custom_object(
+                group=group,
+                version=version,
+                namespace=namespace,
+                plural=method_name,
+                name=name
+            )
+
         else:
             supported_types = (
                 list(core_resources.keys()) + list(apps_resources.keys()) +
                 list(batch_resources.keys()) + list(networking_resources.keys()) +
-                list(tekton_resources.keys()) + list(monitoring_resources.keys()) +
-                list(admission_resources.keys())
+                list(storage_resources.keys()) + list(autoscaling_resources.keys()) +
+                list(tekton_resources.keys()) + list(tekton_triggers_resources.keys()) +
+                list(monitoring_resources.keys()) + list(admission_resources.keys())
             )
             return f"Error: Unsupported resource type '{resource_type}'. Supported types: {', '.join(sorted(supported_types))}"
 
