@@ -2576,85 +2576,78 @@ async def list_recent_pipeline_runs(limit: int = 10) -> Dict[str, List[Dict[str,
     try:
         logger.info(f"Listing recent pipeline runs across all namespaces (limit: {limit})")
 
-        # Get all namespaces
-        all_ns = await list_namespaces()
+        # Use cluster-wide query with limit for performance (single API call)
+        # Use a fixed fetch limit for consistent results regardless of requested limit
+        # The API doesn't sort, so we need to fetch enough to ensure we get the most recent
+        fetch_limit = 200  # Fixed limit for consistent results
 
-        if not all_ns:
-            logger.warning("No namespaces found")
-            return {"error": "No namespaces accessible"}
+        pipeline_runs = k8s_custom_api.list_cluster_custom_object(
+            group="tekton.dev",
+            version="v1",
+            plural="pipelineruns",
+            limit=fetch_limit
+        )
 
         # Collect all pipeline runs
         all_runs: List[Dict[str, Any]] = []
 
-        for namespace in all_ns:
-            try:
-                pipeline_runs = k8s_custom_api.list_namespaced_custom_object(
-                    group="tekton.dev",
-                    version="v1",
-                    namespace=namespace,
-                    plural="pipelineruns"
-                )
+        for pr in pipeline_runs.get("items", []):
+            status = pr.get("status", {})
+            metadata = pr.get("metadata", {})
+            namespace = metadata.get("namespace", "unknown")
 
-                for pr in pipeline_runs.get("items", []):
-                    status = pr.get("status", {})
-                    metadata = pr.get("metadata", {})
+            # Get the start time for sorting
+            start_time = status.get("startTime")
+            if not start_time:
+                # If no start time, use creation time
+                start_time = metadata.get("creationTimestamp")
 
-                    # Get the start time for sorting
-                    start_time = status.get("startTime")
-                    if not start_time:
-                        # If no start time, use creation time
-                        start_time = metadata.get("creationTimestamp")
+            if start_time:
+                # Get status from conditions
+                conditions = status.get("conditions", [])
+                current_status = "Unknown"
+                if conditions:
+                    current_status = conditions[-1].get("reason", "Unknown")
 
-                    if start_time:
-                        # Get status from conditions
-                        conditions = status.get("conditions", [])
-                        current_status = "Unknown"
-                        if conditions:
-                            current_status = conditions[-1].get("reason", "Unknown")
+                # Get pipeline name from multiple sources (same logic as list_pipelineruns)
+                spec = pr.get("spec", {})
+                labels = metadata.get("labels", {})
+                pipeline_name = "unknown"
 
-                        # Get pipeline name from multiple sources (same logic as list_pipelineruns)
-                        spec = pr.get("spec", {})
-                        labels = metadata.get("labels", {})
-                        pipeline_name = "unknown"
+                # 1. Check spec.pipelineRef.name (direct reference)
+                pipeline_ref = spec.get("pipelineRef", {})
+                if pipeline_ref and pipeline_ref.get("name"):
+                    pipeline_name = pipeline_ref.get("name")
 
-                        # 1. Check spec.pipelineRef.name (direct reference)
-                        pipeline_ref = spec.get("pipelineRef", {})
-                        if pipeline_ref and pipeline_ref.get("name"):
-                            pipeline_name = pipeline_ref.get("name")
+                # 2. Check common Tekton labels (used by Konflux)
+                if pipeline_name == "unknown":
+                    pipeline_name = (
+                        labels.get("tekton.dev/pipeline") or
+                        labels.get("pipelines.tekton.dev/pipeline") or
+                        labels.get("pipelines.openshift.io/pipeline") or
+                        "unknown"
+                    )
 
-                        # 2. Check common Tekton labels (used by Konflux)
-                        if pipeline_name == "unknown":
-                            pipeline_name = (
-                                labels.get("tekton.dev/pipeline") or
-                                labels.get("pipelines.tekton.dev/pipeline") or
-                                labels.get("pipelines.openshift.io/pipeline") or
-                                "unknown"
-                            )
+                # 3. Check inline pipelineSpec
+                if pipeline_name == "unknown":
+                    pipeline_spec = spec.get("pipelineSpec", {})
+                    if pipeline_spec:
+                        pipeline_name = (
+                            pipeline_spec.get("displayName") or
+                            pipeline_spec.get("name") or
+                            "inline-pipeline"
+                        )
 
-                        # 3. Check inline pipelineSpec
-                        if pipeline_name == "unknown":
-                            pipeline_spec = spec.get("pipelineSpec", {})
-                            if pipeline_spec:
-                                pipeline_name = (
-                                    pipeline_spec.get("displayName") or
-                                    pipeline_spec.get("name") or
-                                    "inline-pipeline"
-                                )
+                all_runs.append({
+                    "namespace": namespace,
+                    "name": metadata.get("name", "unknown"),
+                    "start_time": start_time,
+                    "status": current_status,
+                    "pipeline": pipeline_name,
+                    "labels": labels
+                })
 
-                        all_runs.append({
-                            "namespace": namespace,
-                            "name": metadata.get("name", "unknown"),
-                            "start_time": start_time,
-                            "status": current_status,
-                            "pipeline": pipeline_name,
-                            "labels": labels
-                        })
-
-            except ApiException as e:
-                if e.status != 404:
-                    logger.warning(f"Error listing pipeline runs in namespace {namespace}: {e}")
-
-        logger.info(f"Found {len(all_runs)} total pipeline runs across all namespaces")
+        logger.info(f"Found {len(all_runs)} pipeline runs from cluster-wide query")
 
         # Sort by start time (most recent first)
         all_runs.sort(key=lambda x: x["start_time"], reverse=True)
