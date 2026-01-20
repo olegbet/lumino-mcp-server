@@ -85,26 +85,39 @@ Get started with LUMINO in under 2 minutes:
 
 ### For Claude Code CLI Users (Easiest)
 
-```bash
-Install the Lumino MCP server as a project-local MCP server:
-    1. Clone https://github.com/spre-sre/lumino-mcp-server into ./lumino-mcp-server
-    2. Install Python dependencies: cd lumino-mcp-server && uv sync
-    3. Create .mcp.json in the current project root (not inside lumino-mcp-server) with:
-        {
-       "mcpServers": {
-         "lumino": {
-           "type": "stdio",
-           "command": "uv",
-           "args": ["run", "python", "main.py"],
-           "cwd": "./lumino-mcp-server"
+Simply ask Claude Code to provision the Lumino MCP server for you by pasting this prompt:
+
+```
+Provision the Lumino MCP server as a project-local MCP integration:
+
+1. Clone the repository:
+   git clone https://github.com/spre-sre/lumino-mcp-server.git
+
+2. Install Python dependencies using uv:
+   cd lumino-mcp-server && uv sync
+
+3. Create .mcp.json in the current project root (NOT inside lumino-mcp-server) with this configuration.
+   IMPORTANT: Replace <ABSOLUTE_PATH_TO_LUMINO> with the actual absolute path to the cloned lumino-mcp-server directory:
+
+   {
+     "mcpServers": {
+       "lumino": {
+         "type": "stdio",
+         "command": "<ABSOLUTE_PATH_TO_LUMINO>/.venv/bin/python",
+         "args": ["<ABSOLUTE_PATH_TO_LUMINO>/main.py"],
+         "env": {
+           "PYTHONUNBUFFERED": "1"
          }
        }
      }
-    4. After setup, inform the user:
-       - Exit Claude Code
-       - Connect to your Kubernetes or OpenShift cluster (kubectl/oc login)
-       - Restart Claude Code - you will see a prompt to approve the Lumino MCP server
-       - Once approved, Lumino tools will be available in the MCP server menu
+   }
+
+4. After creating .mcp.json, inform the user to:
+   - Exit Claude Code completely
+   - Connect to their Kubernetes or OpenShift cluster (kubectl/oc login)
+   - Restart Claude Code in this project directory
+   - They will see a prompt to approve the Lumino MCP server
+   - Once approved, Lumino tools will be available (check with /mcp command)
 ```
 
 ### For Other MCP Clients
@@ -689,34 +702,27 @@ If you prefer manual setup or need to configure Claude Desktop / Cursor, follow 
 
 **Option B: Automatic Provisioning via Claude Code** (Recommended and easiest way)
 
-Simply ask Claude Code to set up the server for you:
-
-```
-Provision the Lumino MCP server from https://github.com/spre-sre/lumino-mcp-server as an MCP integration for this Claude Code project
-```
-
-Claude will automatically clone, configure, and integrate the server into your project.
+Copy and paste the provisioning prompt from the [Quick Start](#for-claude-code-cli-users-easiest) section above into Claude Code. Claude will clone the repository, install dependencies, and configure the MCP server for your project.
 
 **Option C: Manual Configuration**
 
-1. **Find your config file location**:
-   - macOS/Linux: `~/.config/claude/mcp_servers.json`
-   - Windows: `%APPDATA%\claude\mcp_servers.json`
+1. **Clone and install**:
 
-2. **Add LUMINO configuration**:
+```bash
+git clone https://github.com/spre-sre/lumino-mcp-server.git
+cd lumino-mcp-server
+uv sync  # Creates .venv with all dependencies
+```
+
+2. **Create `.mcp.json`** in your project root (for project-local config) or update `~/.claude.json` (for global config):
 
 ```json
 {
   "mcpServers": {
     "lumino": {
-      "command": "uv",
-      "args": [
-        "run",
-        "--directory",
-        "/path/to/lumino-mcp-server",
-        "python",
-        "main.py"
-      ],
+      "type": "stdio",
+      "command": "/absolute/path/to/lumino-mcp-server/.venv/bin/python",
+      "args": ["/absolute/path/to/lumino-mcp-server/main.py"],
       "env": {
         "PYTHONUNBUFFERED": "1"
       }
@@ -724,6 +730,8 @@ Claude will automatically clone, configure, and integrate the server into your p
   }
 }
 ```
+
+**Important**: Replace `/absolute/path/to/lumino-mcp-server` with the actual absolute path where you cloned the repository (e.g., `/Users/username/projects/lumino-mcp-server`).
 
 3. **Verify installation**:
 
