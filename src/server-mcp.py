@@ -8404,8 +8404,16 @@ async def ci_cd_performance_baselining_tool(
                     task_stats[key]["total_count"] += count
 
             # Build task baselines and identify problem tasks
+            # Filter out "unknown" tasks - these indicate missing 'task' label in Prometheus metrics
+            unknown_task_count = 0
             for key, stats in task_stats.items():
                 if stats["total_count"] < 1:
+                    continue
+
+                # Skip entries where task name is "unknown" - this means the Prometheus metric
+                # doesn't have a 'task' label, so the data is aggregated at namespace level only
+                if stats["task"] == "unknown":
+                    unknown_task_count += 1
                     continue
 
                 task_success_rate = (stats["success_count"] / stats["total_count"] * 100) if stats["total_count"] > 0 else 0
@@ -8421,8 +8429,17 @@ async def ci_cd_performance_baselining_tool(
                 }
                 result["task_level_analysis"]["task_baselines"].append(task_baseline)
 
+            # Add note if task-level data is limited
+            if unknown_task_count > 0 and len(result["task_level_analysis"]["task_baselines"]) == 0:
+                result["task_level_analysis"]["note"] = (
+                    f"Task-level analysis unavailable: Prometheus metrics do not include 'task' labels. "
+                    f"Found {unknown_task_count} namespace-level aggregations. "
+                    "For task-level details, query TaskRun resources directly via Kubernetes API."
+                )
+                logger.info(f"Task-level analysis: No task labels in Prometheus metrics ({unknown_task_count} namespaces without task granularity)")
+
             # Sort and get top slowest tasks
-            result["task_level_analysis"]["task_baselines"].sort(key=lambda x: x.get("avg_duration_seconds", 0), reverse=True)
+            result["task_level_analysis"]["task_baselines"].sort(key=lambda x: x.get("avg_duration_seconds", 0) or 0, reverse=True)
             result["task_level_analysis"]["slowest_tasks"] = result["task_level_analysis"]["task_baselines"][:10]
 
             # Get most failed tasks (by failure count)
@@ -8430,7 +8447,7 @@ async def ci_cd_performance_baselining_tool(
             failed_tasks.sort(key=lambda x: x["failed_count"], reverse=True)
             result["task_level_analysis"]["most_failed_tasks"] = failed_tasks[:10]
 
-            logger.info(f"Task-level analysis completed: {len(result['task_level_analysis']['task_baselines'])} tasks analyzed")
+            logger.info(f"Task-level analysis completed: {len(result['task_level_analysis']['task_baselines'])} tasks analyzed (filtered {unknown_task_count} 'unknown' entries)")
 
         # Sort results for better presentation
         result["pipeline_baselines"].sort(key=lambda x: x.get("data_points", 0), reverse=True)
