@@ -111,6 +111,8 @@ from .log_analysis import (
     calculate_entropy,
     extract_log_features,
     train_anomaly_model,
+    train_enhanced_anomaly_model,
+    train_or_load_model,
     analyze_log_patterns_for_failure_prediction,
     generate_failure_predictions,
     # Token limit truncation functions
@@ -221,6 +223,20 @@ from .resource_topology import (
     convert_to_mermaid,
     # Simulation affected components
     identify_affected_components,
+)
+
+from .ml_persistence import (
+    # Model persistence
+    ModelPersistenceManager,
+    # Training data storage
+    TrainingDataStore,
+    # Failure event collection
+    FailureEventCollector,
+    # Model version management
+    ModelVersionManager,
+    # Helper functions
+    build_labels_from_correlations,
+    parse_time_period as parse_ml_time_period,
 )
 
 __all__ = [
@@ -401,4 +417,11 @@ __all__ = [
     "generate_simulation_recommendations",
     # Simulation Affected Components
     "identify_affected_components",
+    # ML Persistence
+    "ModelPersistenceManager",
+    "TrainingDataStore",
+    "FailureEventCollector",
+    "ModelVersionManager",
+    "build_labels_from_correlations",
+    "parse_ml_time_period",
 ]

@@ -84,6 +84,7 @@ from helpers import (
     preprocess_log_data,
     extract_log_features,
     train_anomaly_model,
+    train_or_load_model,
     analyze_log_patterns_for_failure_prediction,
     generate_failure_predictions,
     # Token limit truncation helpers
@@ -10159,12 +10160,14 @@ async def predictive_log_analyzer(
     historical_data_range: str = "30d",
     model_refresh_interval: str = "24h",
     namespaces: Optional[List[str]] = None,
-    max_namespaces: int = 20
+    max_namespaces: int = 20,
+    force_retrain: bool = False
 ) -> Dict[str, Any]:
     """
     Predict failures using ML analysis of historical log patterns before critical outages occur.
 
     Uses anomaly detection algorithms to correlate log patterns with failure events.
+    Supports persistent model storage for faster subsequent calls.
 
     Args:
         prediction_window: Time window - "1h", "6h", "24h", "7d" (default: "6h").
@@ -10175,9 +10178,10 @@ async def predictive_log_analyzer(
         model_refresh_interval: Model retrain frequency (default: "24h").
         namespaces: Specific namespaces to analyze (default: auto-detect active namespaces).
         max_namespaces: Maximum namespaces to scan when auto-detecting (default: 20).
+        force_retrain: Force model retraining even if cached model is valid (default: False).
 
     Returns:
-        Dict: Keys: predictions, model_performance, anomaly_scores, trend_analysis.
+        Dict: Keys: predictions, model_performance, anomaly_scores, trend_analysis, model_info.
     """
     try:
         logger.info(f"Starting predictive log analysis with window: {prediction_window}, threshold: {confidence_threshold}")
@@ -10189,6 +10193,28 @@ async def predictive_log_analyzer(
 
         if not 0.0 <= confidence_threshold <= 1.0:
             raise ValueError("confidence_threshold must be between 0.0 and 1.0")
+
+        # Initialize persistence components (lazy loading)
+        try:
+            from helpers.ml_persistence import (
+                ModelPersistenceManager,
+                TrainingDataStore,
+                FailureEventCollector,
+                ModelVersionManager,
+                build_labels_from_correlations
+            )
+            model_manager = ModelPersistenceManager()
+            training_store = TrainingDataStore()
+            failure_collector = FailureEventCollector(training_store)
+            version_manager = ModelVersionManager(model_manager, training_store)
+            persistence_available = True
+        except Exception as e:
+            logger.warning(f"ML persistence not available, using ephemeral training: {e}")
+            persistence_available = False
+            model_manager = None
+            training_store = None
+            failure_collector = None
+            version_manager = None
 
         # Initialize result structure
         result = {
@@ -10204,6 +10230,13 @@ async def predictive_log_analyzer(
                 "error_rate_trend": "stable",
                 "resource_trend": "stable",
                 "performance_trend": "stable"
+            },
+            "model_info": {
+                "model_id": None,
+                "loaded_from_cache": False,
+                "training_samples": 0,
+                "has_failure_labels": False,
+                "persistence_enabled": persistence_available
             }
         }
 
@@ -10283,20 +10316,104 @@ async def predictive_log_analyzer(
         # Extract features for ML analysis
         features = extract_log_features(log_df)
 
-        # Train anomaly detection model
-        anomaly_model = train_anomaly_model(features)
+        # Collect failure events and correlate with logs if persistence is available
+        labels = None
+        if persistence_available and failure_collector and training_store:
+            try:
+                # Collect failure events from the target namespaces
+                for ns in target_namespaces:
+                    try:
+                        # Collect from Kubernetes events
+                        events_result = await _get_namespace_events_internal(ns, limit=100)
+                        if events_result and "events" in events_result:
+                            failure_collector.collect_from_events(events_result["events"], ns)
+
+                        # Collect from pod statuses
+                        pods = k8s_core_api.list_namespaced_pod(namespace=ns, limit=50)
+                        failure_collector.collect_from_pod_status(pods.items, ns)
+                    except Exception as e:
+                        logger.debug(f"Failed to collect failure events from {ns}: {e}")
+
+                # Get recent failure labels for correlation
+                from datetime import timedelta
+                historical_failures = training_store.get_failure_labels_in_window(
+                    start_time=datetime.now() - timedelta(hours=2),
+                    end_time=datetime.now()
+                )
+
+                # Correlate logs with failures if we have both
+                if historical_failures and len(log_df) > 0:
+                    log_samples = log_df.to_dict('records')
+                    correlations = failure_collector.correlate_logs_with_failures(
+                        log_samples, historical_failures, time_window_minutes=30
+                    )
+                    if correlations:
+                        labels = build_labels_from_correlations(correlations, len(log_df))
+                        logger.info(f"Created {len(correlations)} log-failure correlations")
+
+                # Store log samples for future training
+                for idx, row in log_df.iterrows():
+                    if idx < 500:  # Limit to avoid excessive storage
+                        training_store.store_log_sample({
+                            "timestamp": row.get("timestamp"),
+                            "namespace": target_namespaces[0] if target_namespaces else "unknown",
+                            "features": features[idx].tolist() if idx < len(features) else [],
+                            "raw_message": str(row.get("raw_message", ""))[:500],
+                            "log_level": row.get("log_level"),
+                            "error_indicators": int(row.get("error_indicators", 0)),
+                            "message_entropy": float(row.get("message_entropy", 0.0))
+                        })
+            except Exception as e:
+                logger.warning(f"Failed to collect/correlate failure events: {e}")
+
+        # Train or load model with persistence
+        if persistence_available and model_manager and version_manager:
+            try:
+                anomaly_model, model_id, model_metadata = train_or_load_model(
+                    features=features,
+                    model_manager=model_manager,
+                    version_manager=version_manager,
+                    labels=labels,
+                    force_retrain=force_retrain
+                )
+
+                # Update result with model info
+                result["model_info"].update({
+                    "model_id": model_id,
+                    "loaded_from_cache": model_metadata.get("loaded_from_cache", False),
+                    "training_samples": model_metadata.get("training_samples", len(features)),
+                    "has_failure_labels": labels is not None and len(labels) > 0,
+                    "created_at": model_metadata.get("created_at")
+                })
+
+                # Use performance metrics from model if available
+                perf = model_metadata.get("performance_metrics", {})
+                if perf:
+                    result["model_performance"].update({
+                        "accuracy": perf.get("accuracy", 0.0),
+                        "precision": perf.get("precision", 0.0),
+                        "recall": perf.get("recall", 0.0),
+                        "last_training_time": model_metadata.get("created_at", datetime.now().isoformat())
+                    })
+            except Exception as e:
+                logger.warning(f"Persistence-based training failed, falling back to ephemeral: {e}")
+                anomaly_model = train_anomaly_model(features)
+        else:
+            # Fallback to ephemeral training
+            anomaly_model = train_anomaly_model(features)
+
         anomaly_scores = anomaly_model.decision_function(features)
         anomaly_predictions = anomaly_model.predict(features)
 
-        # Calculate model performance metrics (simulated for demo)
-        normal_predictions = anomaly_predictions == 1
-        accuracy = np.mean(normal_predictions) if len(normal_predictions) > 0 else 0.0
-
-        result["model_performance"].update({
-            "accuracy": float(accuracy),
-            "precision": float(max(0.7, accuracy - 0.1)),  # Simulated precision
-            "recall": float(max(0.6, accuracy - 0.2))       # Simulated recall
-        })
+        # Update model performance if not already set by persistence
+        if result["model_performance"]["accuracy"] == 0.0:
+            normal_predictions = anomaly_predictions == 1
+            accuracy = np.mean(normal_predictions) if len(normal_predictions) > 0 else 0.0
+            result["model_performance"].update({
+                "accuracy": float(accuracy),
+                "precision": float(max(0.7, accuracy - 0.1)),
+                "recall": float(max(0.6, accuracy - 0.2))
+            })
 
         # Generate anomaly scores per component
         components = ["application_pods", "database", "messaging_service", "load_balancer"]
@@ -10371,6 +10488,13 @@ async def predictive_log_analyzer(
                 "error_rate_trend": "error",
                 "resource_trend": "error",
                 "performance_trend": "error"
+            },
+            "model_info": {
+                "model_id": None,
+                "loaded_from_cache": False,
+                "training_samples": 0,
+                "has_failure_labels": False,
+                "persistence_enabled": False
             },
             "error": str(e)
         }
