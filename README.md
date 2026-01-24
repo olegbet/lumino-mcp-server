@@ -3,6 +3,9 @@
 [![License](https://img.shields.io/badge/License-Apache%202.0-blue.svg)](https://opensource.org/licenses/Apache-2.0)
 [![Python](https://img.shields.io/badge/python-3.10%2B-blue.svg)](https://www.python.org/downloads/)
 [![MCP](https://img.shields.io/badge/MCP-1.10%2B-green.svg)](https://modelcontextprotocol.io/)
+[![PyPI](https://img.shields.io/pypi/v/lumino-mcp-server.svg)](https://pypi.org/project/lumino-mcp-server/)
+
+<!-- mcp-name: io.github.geored/lumino -->
 
 An open source MCP (Model Context Protocol) server empowering SREs with intelligent observability, predictive analytics, and AI-driven automation across Kubernetes, OpenShift, and Tekton environments.
 

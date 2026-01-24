@@ -93,3 +93,6 @@ uv.lock
 # Misc
 *.swp
 *.swo
+
+# MCP Registry tokens
+.mcpregistry_*
