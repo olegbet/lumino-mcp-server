@@ -333,19 +333,89 @@ def identify_match_reasons(
 
 
 def extract_log_metadata(line: str) -> Tuple[str, str]:
-    """Extract timestamp and log level from a log line."""
+    """Extract timestamp and log level from a log line.
+
+    Uses positional matching to avoid misclassifying logs that contain
+    log level keywords in their message content (e.g., 'error handling').
+    """
     # Extract timestamp
     timestamp_match = re.search(r'(\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:\d{2})?)', line)
     timestamp = timestamp_match.group(1) if timestamp_match else 'unknown'
 
-    # Extract log level
-    level_patterns = ['error', 'warn', 'info', 'debug', 'fatal', 'panic', 'trace']
+    # Extract log level using positional patterns
+    # Priority order: fatal/panic first, then error, warn, info, debug, trace
     level = 'info'  # default
     line_lower = line.lower()
-    for pattern in level_patterns:
-        if pattern in line_lower:
-            level = pattern
-            break
+
+    # Pattern 1: Log level at start of line (after optional timestamp)
+    # Matches: "ERROR: ...", "2024-01-24 10:30:00 ERROR ...", "10:30:00.123 error ..."
+    start_pattern = re.match(
+        r'^(?:\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:\d{2})?\s+)?'  # optional timestamp
+        r'(?:\d{2}:\d{2}:\d{2}(?:\.\d+)?\s+)?'  # optional time-only
+        r'(fatal|panic|critical|error|err|warn|warning|info|debug|trace)\b',
+        line_lower
+    )
+    if start_pattern:
+        matched = start_pattern.group(1)
+        if matched in ('fatal', 'panic', 'critical'):
+            return timestamp, 'fatal'
+        elif matched in ('error', 'err'):
+            return timestamp, 'error'
+        elif matched in ('warn', 'warning'):
+            return timestamp, 'warn'
+        elif matched == 'info':
+            return timestamp, 'info'
+        elif matched == 'debug':
+            return timestamp, 'debug'
+        elif matched == 'trace':
+            return timestamp, 'trace'
+
+    # Pattern 2: Bracketed log levels: [ERROR], [INFO], [WARN], etc.
+    bracket_match = re.search(r'\[(fatal|panic|critical|error|err|warn|warning|info|debug|trace)\]', line_lower)
+    if bracket_match:
+        matched = bracket_match.group(1)
+        if matched in ('fatal', 'panic', 'critical'):
+            return timestamp, 'fatal'
+        elif matched in ('error', 'err'):
+            return timestamp, 'error'
+        elif matched in ('warn', 'warning'):
+            return timestamp, 'warn'
+        elif matched == 'info':
+            return timestamp, 'info'
+        elif matched == 'debug':
+            return timestamp, 'debug'
+        elif matched == 'trace':
+            return timestamp, 'trace'
+
+    # Pattern 3: Structured log formats: level=error, "level":"error", level: error
+    structured_match = re.search(r'(?:level|lvl|severity)[=:"\s]+["\']?(fatal|panic|critical|error|err|warn|warning|info|debug|trace)["\']?', line_lower)
+    if structured_match:
+        matched = structured_match.group(1)
+        if matched in ('fatal', 'panic', 'critical'):
+            return timestamp, 'fatal'
+        elif matched in ('error', 'err'):
+            return timestamp, 'error'
+        elif matched in ('warn', 'warning'):
+            return timestamp, 'warn'
+        elif matched == 'info':
+            return timestamp, 'info'
+        elif matched == 'debug':
+            return timestamp, 'debug'
+        elif matched == 'trace':
+            return timestamp, 'trace'
+
+    # Pattern 4: Kubernetes-style single letter prefixes: I0124 (info), E0124 (error), W0124 (warn)
+    k8s_match = re.match(r'^([IWEF])\d{4}\s', line)
+    if k8s_match:
+        letter = k8s_match.group(1)
+        if letter == 'I':
+            return timestamp, 'info'
+        elif letter == 'W':
+            return timestamp, 'warn'
+        elif letter == 'E':
+            return timestamp, 'error'
+        elif letter == 'F':
+            return timestamp, 'fatal'
 
     return timestamp, level
 
