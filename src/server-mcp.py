@@ -10505,10 +10505,69 @@ async def predictive_log_analyzer(
 # ============================================================================
 
 
+def _get_active_node_names() -> set:
+    """Get the set of currently active (Ready) node names from Kubernetes API."""
+    try:
+        nodes = k8s_core_api.list_node()
+        active_nodes = set()
+        for node in nodes.items:
+            # Check if node is Ready
+            is_ready = False
+            if node.status and node.status.conditions:
+                for condition in node.status.conditions:
+                    if condition.type == "Ready" and condition.status == "True":
+                        is_ready = True
+                        break
+            if is_ready:
+                # Add node name and possible instance name variations
+                node_name = node.metadata.name
+                active_nodes.add(node_name)
+                # Also add IP-based names that Prometheus might use
+                if node.status and node.status.addresses:
+                    for addr in node.status.addresses:
+                        if addr.type in ["InternalIP", "ExternalIP", "Hostname"]:
+                            active_nodes.add(addr.address)
+                            # Prometheus often uses IP:port format
+                            active_nodes.add(f"{addr.address}:9100")
+        return active_nodes
+    except Exception as e:
+        logger.warning(f"Could not get active nodes from K8s API: {e}")
+        return set()  # Return empty set - will not filter anything
+
+
+def _is_node_active(node_identifier: str, active_nodes: set) -> bool:
+    """Check if a node identifier matches any active node."""
+    if not active_nodes:
+        return True  # If we couldn't get active nodes, don't filter
+
+    # Direct match
+    if node_identifier in active_nodes:
+        return True
+
+    # Try matching without port suffix
+    node_without_port = node_identifier.split(':')[0] if ':' in node_identifier else node_identifier
+    if node_without_port in active_nodes:
+        return True
+
+    # Try matching the hostname part (e.g., ip-10-206-24-150.ec2.internal)
+    for active_node in active_nodes:
+        if node_identifier.startswith(active_node) or active_node.startswith(node_identifier):
+            return True
+        # Handle case where Prometheus uses IP and K8s uses hostname
+        if node_without_port in active_node or active_node in node_without_port:
+            return True
+
+    return False
+
+
 async def _analyze_node_resources_new(trend_period: str, forecast_horizon: str, log) -> List[Dict]:
     """Analyze node-level resource utilization using Prometheus query method."""
     try:
         from datetime import timedelta
+
+        # Get currently active nodes to filter out historical/terminated nodes
+        active_nodes = _get_active_node_names()
+        log.info(f"Found {len(active_nodes)} active nodes from Kubernetes API")
 
         # Calculate time range for trend analysis
         end_time = datetime.now()
@@ -10519,6 +10578,7 @@ async def _analyze_node_resources_new(trend_period: str, forecast_horizon: str, 
         end_time_iso = end_time.isoformat() + "Z"
 
         forecasts = []
+        filtered_count = 0
         forecast_points = calculate_forecast_intervals(forecast_horizon)
 
         # Node CPU usage query - aggregate to avoid series explosion from pod restarts
@@ -10537,6 +10597,12 @@ async def _analyze_node_resources_new(trend_period: str, forecast_horizon: str, 
             if cpu_result.get("status") == "success" and cpu_result.get("data"):
                 for metric in cpu_result["data"]:
                     node = metric.get('metric', {}).get('instance', 'unknown')
+
+                    # Filter out nodes that are no longer active
+                    if not _is_node_active(node, active_nodes):
+                        filtered_count += 1
+                        continue
+
                     values = [float(point[1]) for point in metric.get('values', [])]
 
                     if values:
@@ -10579,6 +10645,12 @@ async def _analyze_node_resources_new(trend_period: str, forecast_horizon: str, 
             if memory_result.get("status") == "success" and memory_result.get("data"):
                 for metric in memory_result["data"]:
                     node = metric.get('metric', {}).get('instance', 'unknown')
+
+                    # Filter out nodes that are no longer active
+                    if not _is_node_active(node, active_nodes):
+                        filtered_count += 1
+                        continue
+
                     values = [float(point[1]) for point in metric.get('values', [])]
 
                     if values:
@@ -10623,6 +10695,12 @@ async def _analyze_node_resources_new(trend_period: str, forecast_horizon: str, 
             if disk_result.get("status") == "success" and disk_result.get("data"):
                 for metric in disk_result["data"]:
                     node = metric.get('metric', {}).get('instance', 'unknown')
+
+                    # Filter out nodes that are no longer active
+                    if not _is_node_active(node, active_nodes):
+                        filtered_count += 1
+                        continue
+
                     mountpoint = metric.get('metric', {}).get('mountpoint', 'unknown')
                     values = [float(point[1]) for point in metric.get('values', [])]
 
@@ -10647,6 +10725,9 @@ async def _analyze_node_resources_new(trend_period: str, forecast_horizon: str, 
                         })
         except Exception as e:
             log.warning(f"Error fetching disk metrics: {str(e)}")
+
+        if filtered_count > 0:
+            log.info(f"Filtered out {filtered_count} metrics from inactive/historical nodes")
 
         return forecasts
 
