@@ -7726,13 +7726,15 @@ async def check_cluster_certificate_health(
             except ApiException as e:
                 if e.status == 403:
                     logger.debug(f"Access denied to namespace {namespace}: {e.reason}")
-                    skipped_namespaces_rbac.append(namespace)
+                    if namespace not in skipped_namespaces_rbac:
+                        skipped_namespaces_rbac.append(namespace)
                 else:
                     logger.warning(f"Error scanning namespace {namespace}: {e.reason}")
                 continue
 
         # Process OpenShift system certificates if requested
-        if include_system_certs:
+        # Only scan additional system namespaces if user didn't specify specific namespaces
+        if include_system_certs and namespaces is None:
             try:
                 # Try to get OpenShift cluster certificates
                 system_cert_namespaces = [
@@ -7777,7 +7779,8 @@ async def check_cluster_certificate_health(
                                                 logger.debug(f"Could not parse system cert {secret.metadata.name}/{key}: {parse_err}")
                         except ApiException as e:
                             if e.status == 403:
-                                skipped_namespaces_rbac.append(sys_ns)
+                                if sys_ns not in skipped_namespaces_rbac:
+                                    skipped_namespaces_rbac.append(sys_ns)
                             continue
 
             except Exception as e:
