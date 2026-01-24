@@ -2556,31 +2556,73 @@ async def analyze_failed_pipeline(namespace: str, pipeline_run: str) -> Dict[str
 
             # Get logs for the pod associated with this task
             pod_name = task_details.get("pod", "unknown")
-            pod_logs = await get_pod_logs(namespace, pod_name) if pod_name != "unknown" else {"error": "No pod logs available"}
+            pod_logs_available = True
+            log_content = ""
+            logs_unavailable_reason = None
 
-            # Extract log content as string for analysis
-            if isinstance(pod_logs, dict) and "logs" in pod_logs:
-                log_content = ""
-                for pod, logs in pod_logs["logs"].items():
-                    if isinstance(logs, list):
-                        log_content += "\n".join(logs)
-                    else:
-                        log_content += str(logs)
+            if pod_name == "unknown":
+                pod_logs_available = False
+                logs_unavailable_reason = "No pod associated with this task"
             else:
-                log_content = str(pod_logs.get("error", "No pod logs available"))
+                pod_logs = await get_pod_logs(namespace, pod_name)
 
-            # Analyze logs for this pod
-            log_analysis = await analyze_logs(log_content)
+                # Extract log content as string for analysis
+                if isinstance(pod_logs, dict) and "logs" in pod_logs:
+                    for container, logs in pod_logs["logs"].items():
+                        if isinstance(logs, list):
+                            log_content += "\n".join(logs)
+                        else:
+                            log_content += str(logs)
+                elif isinstance(pod_logs, dict) and "error" in pod_logs:
+                    pod_logs_available = False
+                    error_msg = pod_logs.get("error", "")
+                    if "Not Found" in error_msg:
+                        logs_unavailable_reason = "Pod was deleted (normal for completed pipelines)"
+                    else:
+                        logs_unavailable_reason = error_msg
 
-            results["failed_tasks"].append({
+            # Build failed step info from TaskRun status as fallback/supplement
+            failed_steps = []
+            for step in task_details.get("steps", []):
+                if step.get("exit_code") is not None and step.get("exit_code") != 0:
+                    failed_steps.append({
+                        "step_name": step.get("name"),
+                        "exit_code": step.get("exit_code"),
+                        "reason": step.get("reason")
+                    })
+
+            # Analyze logs if available, otherwise use step info for context
+            if pod_logs_available and log_content.strip():
+                log_analysis = await analyze_logs(log_content)
+                error_patterns = log_analysis.get("error_patterns", [])
+                error_categories = log_analysis.get("categorized_errors", {})
+            else:
+                # Use step failure info when logs unavailable
+                error_patterns = []
+                error_categories = {}
+                for step in failed_steps:
+                    error_patterns.append(f"Step '{step['step_name']}' failed with exit code {step['exit_code']}")
+                if failed_steps:
+                    error_categories["step_failures"] = len(failed_steps)
+
+            # Build task result
+            task_result = {
                 "task_name": task.get("task"),
                 "task_run": task_name,
                 "status": task_details.get("status"),
                 "message": task_details.get("message"),
-                "error_patterns": log_analysis.get("error_patterns", []),
-                "error_categories": log_analysis.get("categorized_errors", {}),
-                "pod": pod_name
-            })
+                "error_patterns": error_patterns,
+                "error_categories": error_categories,
+                "pod": pod_name,
+                "failed_steps": failed_steps
+            }
+
+            # Add note if logs were unavailable
+            if not pod_logs_available:
+                task_result["logs_unavailable"] = True
+                task_result["logs_unavailable_reason"] = logs_unavailable_reason
+
+            results["failed_tasks"].append(task_result)
 
         # Determine root cause and recommend actions
         results["probable_root_cause"] = determine_root_cause(results)
