@@ -8908,32 +8908,36 @@ async def _get_fallback_cluster_health() -> Dict[str, Any]:
     """
     Fallback cluster health analysis using standard Kubernetes resources.
     Used when OpenShift-specific cluster operators are not accessible.
+
+    Note: This returns component health checks (namespaces, nodes) NOT actual
+    ClusterOperator resources. The output is structured similarly for compatibility
+    but clearly marked as fallback_mode=True.
     """
     logger.info("Performing fallback cluster health analysis using standard Kubernetes resources")
 
     cluster_info = {}
-    operator_status = []
+    component_health = []  # Not operators - these are namespace/node health checks
     critical_issues = []
 
     try:
         # Get basic cluster information
         try:
-            # Try to get cluster version from Kubernetes API
-            version_info = k8s_core_api.get_api_resources()
+            from kubernetes.client import VersionApi
             api_server_url = k8s_core_api.api_client.configuration.host
 
-            # Try to get version endpoint
+            # Use the proper VersionApi to get cluster version
             try:
-                version_data = k8s_core_api.api_client.call_api('/version', 'GET', auth_settings=['BearerToken'])
-                if version_data and len(version_data) > 0:
-                    version_info = version_data[0]
-                    cluster_info = {
-                        "cluster_version": version_info.get('gitVersion', 'unknown'),
-                        "platform": version_info.get('platform', 'unknown'),
-                        "api_server": api_server_url,
-                        "build_date": version_info.get('buildDate', 'unknown')
-                    }
-            except:
+                version_api = VersionApi(k8s_core_api.api_client)
+                version_info = version_api.get_code()
+                cluster_info = {
+                    "cluster_version": version_info.git_version or "unknown",
+                    "platform": version_info.platform or "unknown",
+                    "api_server": api_server_url,
+                    "build_date": version_info.build_date or "unknown",
+                    "go_version": version_info.go_version or "unknown"
+                }
+            except Exception as version_error:
+                logger.warning(f"Could not get version via VersionApi: {version_error}")
                 cluster_info = {
                     "cluster_version": "unknown",
                     "platform": "unknown",
@@ -8972,14 +8976,15 @@ async def _get_fallback_cluster_health() -> Dict[str, Any]:
                     elif health_ratio < 0.9:
                         status = "warning"
 
-                    operator_status.append({
-                        "name": f"namespace-{ns_name}",
+                    component_health.append({
+                        "name": f"system-namespace:{ns_name}",
+                        "type": "namespace_health",  # Clearly indicates this is NOT an operator
                         "namespace": ns_name,
                         "status": status,
                         "available": health_ratio >= 0.8,
                         "degraded": health_ratio < 0.8,
                         "progressing": False,
-                        "version": "kubernetes-native",
+                        "version": "n/a",
                         "conditions_analysis": {
                             "total_pods": total_pods,
                             "running_pods": running_pods,
@@ -8990,7 +8995,7 @@ async def _get_fallback_cluster_health() -> Dict[str, Any]:
 
                     if failed_pods > 0:
                         critical_issues.append({
-                            "operator": f"namespace-{ns_name}",
+                            "component": f"system-namespace:{ns_name}",
                             "severity": "warning" if failed_pods < 3 else "critical",
                             "issue": f"{failed_pods} failed pods in {ns_name} namespace",
                             "impact": f"Potential service disruption in {ns_name}",
@@ -8999,21 +9004,22 @@ async def _get_fallback_cluster_health() -> Dict[str, Any]:
 
                 except Exception as e:
                     logger.warning(f"Could not analyze namespace {ns_name}: {e}")
-                    operator_status.append({
-                        "name": f"namespace-{ns_name}",
+                    component_health.append({
+                        "name": f"system-namespace:{ns_name}",
+                        "type": "namespace_health",
                         "namespace": ns_name,
                         "status": "unknown",
                         "available": False,
                         "degraded": False,
                         "progressing": False,
-                        "version": "unknown",
+                        "version": "n/a",
                         "conditions_analysis": {"error": str(e)}
                     })
 
         except Exception as e:
             logger.warning(f"Could not analyze system namespaces: {e}")
             critical_issues.append({
-                "operator": "namespace-analysis",
+                "component": "namespace-analysis",
                 "severity": "warning",
                 "issue": f"Could not analyze system namespaces: {str(e)}",
                 "impact": "Limited visibility into system component health",
@@ -9035,14 +9041,15 @@ async def _get_fallback_cluster_health() -> Dict[str, Any]:
             node_health_ratio = ready_nodes / total_nodes if total_nodes > 0 else 0
             node_status = "available" if node_health_ratio >= 0.8 else "degraded"
 
-            operator_status.append({
+            component_health.append({
                 "name": "cluster-nodes",
+                "type": "node_health",  # Clearly indicates this is NOT an operator
                 "namespace": "cluster-scoped",
                 "status": node_status,
                 "available": node_health_ratio >= 0.8,
                 "degraded": node_health_ratio < 0.8,
                 "progressing": False,
-                "version": "kubernetes-native",
+                "version": "n/a",
                 "conditions_analysis": {
                     "total_nodes": total_nodes,
                     "ready_nodes": ready_nodes,
@@ -9052,7 +9059,7 @@ async def _get_fallback_cluster_health() -> Dict[str, Any]:
 
             if ready_nodes < total_nodes:
                 critical_issues.append({
-                    "operator": "cluster-nodes",
+                    "component": "cluster-nodes",
                     "severity": "critical" if node_health_ratio < 0.5 else "warning",
                     "issue": f"{total_nodes - ready_nodes} of {total_nodes} nodes not ready",
                     "impact": "Reduced cluster capacity and potential service disruption",
@@ -9062,34 +9069,42 @@ async def _get_fallback_cluster_health() -> Dict[str, Any]:
         except Exception as e:
             logger.warning(f"Could not analyze node health: {e}")
             critical_issues.append({
-                "operator": "cluster-nodes",
+                "component": "cluster-nodes",
                 "severity": "warning",
                 "issue": f"Could not analyze node health: {str(e)}",
                 "impact": "No visibility into node status",
                 "recommended_action": "Check RBAC permissions for node listing"
             })
 
-        # Calculate health summary
-        total_operators = len(operator_status)
-        healthy_operators = len([op for op in operator_status if op.get("status") == "available"])
-        degraded_operators = len([op for op in operator_status if op.get("degraded", False)])
+        # Calculate health summary (for components, not operators)
+        total_components = len(component_health)
+        healthy_components = len([c for c in component_health if c.get("status") == "available"])
+        degraded_components = len([c for c in component_health if c.get("degraded", False)])
 
         overall_health = "healthy"
-        if degraded_operators > 0:
+        if degraded_components > 0:
             overall_health = "degraded"
-        elif healthy_operators < total_operators:
+        elif healthy_components < total_components:
             overall_health = "warning"
 
         health_summary = {
-            "total_operators": total_operators,
-            "healthy_operators": healthy_operators,
-            "degraded_operators": degraded_operators,
-            "overall_health": overall_health
+            "fallback_mode": True,  # Clearly indicates this is NOT OpenShift operator data
+            "total_components": total_components,
+            "healthy_components": healthy_components,
+            "degraded_components": degraded_components,
+            # Keep operator fields for backwards compatibility but set to 0
+            "total_operators": 0,
+            "healthy_operators": 0,
+            "degraded_operators": 0,
+            "overall_health": overall_health,
+            "note": "ClusterOperator access denied. Showing system component health instead."
         }
 
         return {
+            "fallback_mode": True,
             "cluster_info": cluster_info,
-            "operator_status": operator_status,
+            "operator_status": [],  # Empty - we don't have operator access
+            "component_health": component_health,  # New field with actual health data
             "health_summary": health_summary,
             "critical_issues": critical_issues,
             "dependencies": None
@@ -9098,11 +9113,23 @@ async def _get_fallback_cluster_health() -> Dict[str, Any]:
     except Exception as e:
         logger.error(f"Fallback cluster health analysis failed: {e}")
         return {
+            "fallback_mode": True,
             "cluster_info": {"error": "Fallback analysis failed"},
             "operator_status": [],
-            "health_summary": {"total_operators": 0, "healthy_operators": 0, "degraded_operators": 0, "overall_health": "unknown"},
+            "component_health": [],
+            "health_summary": {
+                "fallback_mode": True,
+                "total_components": 0,
+                "healthy_components": 0,
+                "degraded_components": 0,
+                "total_operators": 0,
+                "healthy_operators": 0,
+                "degraded_operators": 0,
+                "overall_health": "unknown",
+                "note": "Fallback analysis failed"
+            },
             "critical_issues": [{
-                "operator": "fallback-analysis",
+                "component": "fallback-analysis",
                 "severity": "critical",
                 "issue": f"Fallback cluster health analysis failed: {str(e)}",
                 "impact": "No cluster health information available",
@@ -9299,7 +9326,7 @@ async def get_openshift_cluster_operator_status(
             try:
                 fallback_result = await _get_fallback_cluster_health()
                 fallback_result["critical_issues"].insert(0, {
-                    "operator": "openshift-api",
+                    "component": "openshift-api-access",
                     "severity": "warning",
                     "issue": "Limited permissions for OpenShift cluster operators. Using fallback analysis.",
                     "impact": "Reduced visibility into OpenShift-specific operator status",
@@ -9317,7 +9344,7 @@ async def get_openshift_cluster_operator_status(
             try:
                 fallback_result = await _get_fallback_cluster_health()
                 fallback_result["critical_issues"].insert(0, {
-                    "operator": "cluster-type",
+                    "component": "cluster-type-detection",
                     "severity": "info",
                     "issue": "Not an OpenShift cluster - using standard Kubernetes health analysis",
                     "impact": "OpenShift-specific operator monitoring not available",
@@ -9331,7 +9358,7 @@ async def get_openshift_cluster_operator_status(
             "cluster_info": {},
             "operator_status": [],
             "health_summary": {"total_operators": 0, "healthy_operators": 0, "degraded_operators": 0, "overall_health": "unknown"},
-            "critical_issues": [{"operator": "system", "severity": "critical", "issue": error_msg, "impact": "Cannot assess cluster operator status", "recommended_action": "Check cluster access and RBAC permissions"}],
+            "critical_issues": [{"component": "api-access", "severity": "critical", "issue": error_msg, "impact": "Cannot assess cluster operator status", "recommended_action": "Check cluster access and RBAC permissions"}],
             "dependencies": [] if include_dependencies else None
         }
 
@@ -9343,7 +9370,7 @@ async def get_openshift_cluster_operator_status(
             "cluster_info": {},
             "operator_status": [],
             "health_summary": {"total_operators": 0, "healthy_operators": 0, "degraded_operators": 0, "overall_health": "unknown"},
-            "critical_issues": [{"operator": "system", "severity": "critical", "issue": error_msg, "impact": "Cannot assess cluster operator status", "recommended_action": "Check system logs and cluster connectivity"}],
+            "critical_issues": [{"component": "system-error", "severity": "critical", "issue": error_msg, "impact": "Cannot assess cluster operator status", "recommended_action": "Check system logs and cluster connectivity"}],
             "dependencies": [] if include_dependencies else None
         }
 
