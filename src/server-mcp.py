@@ -3409,13 +3409,15 @@ async def detect_log_anomalies(
         threshold_config = thresholds.get(severity_threshold, thresholds["medium"])
 
         # 1. Analyze error frequency patterns
-        error_patterns = [
-            r"(?i)(error|exception|failed|fatal|panic|critical)",
-            r"(?i)(timeout|connection\s+refused|connection\s+reset)",
-            r"(?i)(out\s+of\s+memory|memory\s+limit|oom)",
-            r"(?i)(permission\s+denied|access\s+denied|unauthorized)",
-            r"(?i)(not\s+found|missing|invalid|corrupt)"
-        ]
+        # Map patterns to human-readable category names
+        error_pattern_map = {
+            r"(?i)(error|exception|failed|fatal|panic|critical)": "error",
+            r"(?i)(timeout|connection\s+refused|connection\s+reset)": "timeout",
+            r"(?i)(out\s+of\s+memory|memory\s+limit|oom)": "memory",
+            r"(?i)(permission\s+denied|access\s+denied|unauthorized)": "permission",
+            r"(?i)(not\s+found|missing|invalid|corrupt)": "not_found"
+        }
+        error_patterns = list(error_pattern_map.keys())
 
         error_counts = {}
         error_lines = []
@@ -3424,7 +3426,7 @@ async def detect_log_anomalies(
             for pattern in error_patterns:
                 if re.search(pattern, line):
                     error_lines.append((i, line))
-                    pattern_key = pattern.split('(')[1].split('|')[0] if '|' in pattern else pattern
+                    pattern_key = error_pattern_map.get(pattern, "other")
                     error_counts[pattern_key] = error_counts.get(pattern_key, 0) + 1
 
         error_rate = len(error_lines) / total_lines
